@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.8.62] - 2026-06-13
+
+### Added
+
+- **`list_all_artifacts`**: global My Files aggregation across sessions.
+- **Notification `pool_name` and session schema extensions** (from v0.8.61 line).
+
+### Fixed
+
+- **`is_allowed_plan_path`**: cross-platform plan path validation on Windows/macOS (merged from v0.8.60).
+
 ## [0.8.60] - 2026-06-13
 
 ### Fixed

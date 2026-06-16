@@ -63,6 +63,19 @@ pub struct Session {
     /// injection in this session. NULL = use global workspace_root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_root: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived_at: Option<DateTime<Utc>>,
+    /// Explicit binding to a pool (team) session for team-task main chat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool_session_id: Option<String>,
+    /// Per-session tool policy override: "strict" | "balanced" | "dev". NULL = inherit global.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_mode: Option<String>,
+    /// Per-session override for accessing files outside workspace. NULL = inherit global.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_outside_workspace: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -336,6 +349,10 @@ fn parse_optional_datetime(value: Option<String>) -> Option<DateTime<Utc>> {
     value.and_then(|raw| raw.parse::<DateTime<Utc>>().ok())
 }
 
+fn parse_optional_bool(value: Option<i64>) -> Option<bool> {
+    value.map(|v| v != 0)
+}
+
 fn map_session_row(r: &Row<'_>) -> rusqlite::Result<Session> {
     Ok(Session {
         id: r.get(0)?,
@@ -351,6 +368,11 @@ fn map_session_row(r: &Row<'_>) -> rusqlite::Result<Session> {
         total_output_tokens: r.get(10)?,
         last_compacted_at: parse_optional_datetime(r.get::<_, Option<String>>(11)?),
         workspace_root: r.get(12).ok().flatten(),
+        pinned_at: parse_optional_datetime(r.get::<_, Option<String>>(13).ok().flatten()),
+        archived_at: parse_optional_datetime(r.get::<_, Option<String>>(14).ok().flatten()),
+        pool_session_id: r.get(15).ok().flatten(),
+        policy_mode: r.get(16).ok().flatten(),
+        allow_outside_workspace: parse_optional_bool(r.get::<_, Option<i64>>(17).ok().flatten()),
     })
 }
 
@@ -587,6 +609,23 @@ impl Database {
         let _ = self
             .conn
             .execute("ALTER TABLE sessions ADD COLUMN workspace_root TEXT", []);
+
+        let _ = self
+            .conn
+            .execute("ALTER TABLE sessions ADD COLUMN pinned_at TEXT", []);
+        let _ = self
+            .conn
+            .execute("ALTER TABLE sessions ADD COLUMN archived_at TEXT", []);
+        let _ = self
+            .conn
+            .execute("ALTER TABLE sessions ADD COLUMN pool_session_id TEXT", []);
+        let _ = self
+            .conn
+            .execute("ALTER TABLE sessions ADD COLUMN policy_mode TEXT", []);
+        let _ = self.conn.execute(
+            "ALTER TABLE sessions ADD COLUMN allow_outside_workspace INTEGER",
+            [],
+        );
 
         // Memory enhancement: add embedding and memory_type columns (ignore if already exist)
         let _ = self
@@ -1158,7 +1197,62 @@ impl Database {
             total_output_tokens: 0,
             last_compacted_at: None,
             workspace_root: None,
+            pinned_at: None,
+            archived_at: None,
+            pool_session_id: None,
+            policy_mode: None,
+            allow_outside_workspace: None,
         })
+    }
+
+    pub fn pin_session(&self, id: &str) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "UPDATE sessions SET pinned_at = ?1, updated_at = ?1 WHERE id = ?2",
+            params![now, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn unpin_session(&self, id: &str) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "UPDATE sessions SET pinned_at = NULL, updated_at = ?1 WHERE id = ?2",
+            params![now, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn archive_session(&self, id: &str) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "UPDATE sessions SET archived_at = ?1, updated_at = ?1 WHERE id = ?2",
+            params![now, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn restore_session(&self, id: &str) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "UPDATE sessions SET archived_at = NULL, updated_at = ?1 WHERE id = ?2",
+            params![now, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_archived_sessions(&self, limit: i64, offset: i64) -> Result<Vec<Session>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, title, status, COALESCE(source, 'chat'), created_at, updated_at, message_count, \
+                    COALESCE(rolling_summary, ''), COALESCE(rolling_summary_version, 0), \
+                    COALESCE(total_input_tokens, 0), COALESCE(total_output_tokens, 0), last_compacted_at, \
+                    workspace_root, pinned_at, archived_at, pool_session_id, policy_mode, \
+                    allow_outside_workspace \
+             FROM sessions WHERE archived_at IS NOT NULL ORDER BY archived_at DESC LIMIT ?1 OFFSET ?2",
+        )?;
+        let rows = stmt.query_map(params![limit, offset], map_session_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
 
     pub fn get_session(&self, id: &str) -> Result<Option<Session>> {
@@ -1166,7 +1260,8 @@ impl Database {
             "SELECT id, title, status, COALESCE(source, 'chat'), created_at, updated_at, message_count, \
                     COALESCE(rolling_summary, ''), COALESCE(rolling_summary_version, 0), \
                     COALESCE(total_input_tokens, 0), COALESCE(total_output_tokens, 0), last_compacted_at, \
-                    workspace_root \
+                    workspace_root, pinned_at, archived_at, pool_session_id, policy_mode, \
+                    allow_outside_workspace \
              FROM sessions WHERE id = ?1"
         )?;
         let mut rows = stmt.query_map(params![id], map_session_row)?;
@@ -1338,8 +1433,11 @@ impl Database {
             "SELECT id, title, status, COALESCE(source, 'chat'), created_at, updated_at, message_count, \
                     COALESCE(rolling_summary, ''), COALESCE(rolling_summary_version, 0), \
                     COALESCE(total_input_tokens, 0), COALESCE(total_output_tokens, 0), last_compacted_at, \
-                    workspace_root \
-             FROM sessions ORDER BY updated_at DESC LIMIT ?1 OFFSET ?2"
+                    workspace_root, pinned_at, archived_at, pool_session_id, policy_mode, \
+                    allow_outside_workspace \
+             FROM sessions WHERE archived_at IS NULL ORDER BY \
+                    CASE WHEN pinned_at IS NOT NULL THEN 0 ELSE 1 END, \
+                    COALESCE(pinned_at, updated_at) DESC, updated_at DESC LIMIT ?1 OFFSET ?2"
         )?;
         let rows = stmt.query_map(params![limit, offset], map_session_row)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -1402,6 +1500,41 @@ impl Database {
         self.conn.execute(
             "UPDATE sessions SET workspace_root = ?1, updated_at = ?2 WHERE id = ?3",
             params![workspace_root, now, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_session_pool_id(&self, id: &str, pool_session_id: Option<&str>) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "UPDATE sessions SET pool_session_id = ?1, updated_at = ?2 WHERE id = ?3",
+            params![pool_session_id, now, id],
+        )?;
+        Ok(())
+    }
+
+    /// Set or clear the per-session tool policy override.
+    /// Pass `None` to inherit the global policy_mode from settings.
+    pub fn set_session_policy_mode(&self, id: &str, policy_mode: Option<&str>) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "UPDATE sessions SET policy_mode = ?1, updated_at = ?2 WHERE id = ?3",
+            params![policy_mode, now, id],
+        )?;
+        Ok(())
+    }
+
+    /// Pass `None` to inherit the global allow_outside_workspace from settings.
+    pub fn set_session_allow_outside_workspace(
+        &self,
+        id: &str,
+        allow_outside_workspace: Option<bool>,
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        let value: Option<i64> = allow_outside_workspace.map(|allowed| i64::from(allowed));
+        self.conn.execute(
+            "UPDATE sessions SET allow_outside_workspace = ?1, updated_at = ?2 WHERE id = ?3",
+            params![value, now, id],
         )?;
         Ok(())
     }
@@ -1758,6 +1891,33 @@ impl Database {
              FROM session_artifacts WHERE session_id = ?1 ORDER BY rowid DESC LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![session_id, limit.max(1)], |r| {
+            Ok(SessionArtifact {
+                id: r.get(0)?,
+                session_id: r.get(1)?,
+                name: r.get(2)?,
+                artifact_type: r.get(3)?,
+                uri: r.get(4)?,
+                content_summary: r.get(5)?,
+                source_tool: r.get(6)?,
+                tool_use_id: r.get(7)?,
+                metadata_json: r.get(8)?,
+                created_at: r
+                    .get::<_, String>(9)?
+                    .parse::<DateTime<Utc>>()
+                    .unwrap_or_else(|_| Utc::now()),
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// List artifacts across all sessions, newest first (for global "My Files").
+    pub fn list_all_artifacts(&self, limit: i64) -> Result<Vec<SessionArtifact>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, session_id, name, artifact_type, uri, content_summary, source_tool, tool_use_id, metadata_json, created_at \
+             FROM session_artifacts ORDER BY rowid DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit.max(1)], |r| {
             Ok(SessionArtifact {
                 id: r.get(0)?,
                 session_id: r.get(1)?,
@@ -4216,6 +4376,15 @@ impl Database {
         self.conn.execute(
             "UPDATE pool_sessions SET org_spec = ?2, updated_at = ?3 WHERE id = ?1",
             params![id, org_spec, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_pool_session_name(&self, id: &str, name: &str) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "UPDATE pool_sessions SET name = ?2, updated_at = ?3 WHERE id = ?1",
+            params![id, name, now],
         )?;
         Ok(())
     }

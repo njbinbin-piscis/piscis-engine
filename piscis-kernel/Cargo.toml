@@ -1,6 +1,6 @@
 [package]
 name = "piscis-kernel"
-version = "0.8.60"
+version = "0.8.62"
 edition = "2021"
 description = "OpenPiscis agent runtime kernel - OS/UI-neutral agent loop, LLM, storage, memory and platform-neutral tools."
 

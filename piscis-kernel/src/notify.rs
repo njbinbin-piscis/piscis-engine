@@ -178,6 +178,9 @@ pub struct NotificationRequest {
     /// the IM message can mention the project name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pool_id: Option<String>,
+    /// Human-readable pool / team task name for UI and IM fallbacks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool_name: Option<String>,
     /// Optional `pending_decisions.id` to wire the notification to a
     /// specific decision request. Phase 4 will use this; Phase 0/1/2
     /// callers leave it empty.
@@ -202,6 +205,7 @@ impl NotificationRequest {
             level: NotificationLevel::Info,
             source: String::new(),
             pool_id: None,
+            pool_name: None,
             decision_id: None,
             duration_ms: None,
             targets: Vec::new(),
@@ -220,6 +224,11 @@ impl NotificationRequest {
 
     pub fn with_pool(mut self, pool_id: impl Into<String>) -> Self {
         self.pool_id = Some(pool_id.into());
+        self
+    }
+
+    pub fn with_pool_name(mut self, pool_name: impl Into<String>) -> Self {
+        self.pool_name = Some(pool_name.into());
         self
     }
 
