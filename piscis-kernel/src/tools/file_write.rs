@@ -9,6 +9,13 @@ use super::output::{format_err, ToolErrorCode};
 
 const UTF8_BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
 
+/// P2-3: default ceiling on `file_write`'s `content` parameter, in UTF-8
+/// characters. This is deliberately separate from JSON-truncation handling
+/// (P0-2/P2-2) — the arguments here parsed *successfully*, this is purely
+/// "the model asked for something too big to write in one call, tell it to
+/// use a different tool instead of silently truncating or OOM-ing."
+const MAX_FILE_WRITE_CONTENT_CHARS: usize = 200_000;
+
 /// Return true if the file starts with a UTF-8 BOM.
 fn file_has_utf8_bom(path: &std::path::Path) -> bool {
     let mut buf = [0u8; 3];
@@ -125,6 +132,26 @@ impl Tool for FileWriteTool {
             None => return Ok(ToolResult::err("Missing required parameter: content")),
         };
 
+        // P2-3: reject oversized content explicitly rather than writing a
+        // truncated/partial file or risking the arguments having been cut
+        // off by an upstream token/byte limit in the first place (that
+        // failure mode is caught earlier, in the JSON parsing layer — this
+        // guards the case where the JSON parsed fine but the value is just
+        // too large for a single write).
+        let content_chars = content.chars().count();
+        if content_chars > MAX_FILE_WRITE_CONTENT_CHARS {
+            return Ok(ToolResult::err(format_err(
+                ToolErrorCode::ContentTooLarge,
+                &format!(
+                    "content is {} characters, which exceeds the {} character limit for a single file_write call",
+                    content_chars, MAX_FILE_WRITE_CONTENT_CHARS
+                ),
+                "Split the write into smaller pieces: create the file with an initial chunk via file_write, \
+                 then use file_edit to append/replace the remaining sections — or write it in multiple \
+                 file_write calls to different files and combine them via shell if appropriate.",
+            )));
+        }
+
         let path = if std::path::Path::new(path_str).is_absolute() {
             std::path::PathBuf::from(path_str)
         } else {
@@ -153,6 +180,91 @@ impl Tool for FileWriteTool {
 // ---------------------------------------------------------------------------
 // File Edit Tool (patch-based, supports single edit or batched edits array)
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod file_write_size_limit_tests {
+    use super::*;
+    use crate::agent::tool::ToolSettings;
+    use serde_json::json;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+
+    fn test_ctx(root: std::path::PathBuf) -> ToolContext {
+        ToolContext {
+            session_id: "file-write-size-limit-test".into(),
+            workspace_root: root,
+            bypass_permissions: false,
+            settings: Arc::new(ToolSettings::default()),
+            max_iterations: Some(1),
+            memory_owner_id: "piscis".into(),
+            pool_session_id: None,
+            tool_use_id: None,
+            cancel: Arc::new(AtomicBool::new(false)),
+            loop_halt: None,
+        }
+    }
+
+    fn unique_workspace(label: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("piscis-file-write-{label}-{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn rejects_content_over_the_limit_without_writing_anything() {
+        let root = unique_workspace("too-large");
+        let ctx = test_ctx(root.clone());
+        let oversized = "x".repeat(MAX_FILE_WRITE_CONTENT_CHARS + 1);
+
+        let result = FileWriteTool
+            .call(json!({"path": "out.txt", "content": oversized}), &ctx)
+            .await
+            .expect("call should not error at the Rust level");
+
+        assert!(result.is_error, "expected a tool error, got {:?}", result);
+        assert!(result.content.contains("content_too_large"), "content={}", result.content);
+        assert!(!root.join("out.txt").exists(), "must not write a partial file");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn accepts_content_at_exactly_the_limit() {
+        let root = unique_workspace("at-limit");
+        let ctx = test_ctx(root.clone());
+        let exactly_at_limit = "x".repeat(MAX_FILE_WRITE_CONTENT_CHARS);
+
+        let result = FileWriteTool
+            .call(json!({"path": "out.txt", "content": exactly_at_limit}), &ctx)
+            .await
+            .expect("call should succeed");
+
+        assert!(!result.is_error, "content={}", result.content);
+        assert!(root.join("out.txt").exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn small_content_is_unaffected() {
+        let root = unique_workspace("small");
+        let ctx = test_ctx(root.clone());
+
+        let result = FileWriteTool
+            .call(json!({"path": "out.txt", "content": "hello"}), &ctx)
+            .await
+            .expect("call should succeed");
+
+        assert!(!result.is_error, "content={}", result.content);
+        assert_eq!(std::fs::read_to_string(root.join("out.txt")).unwrap(), "hello");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
 
 pub struct FileEditTool;
 

@@ -93,8 +93,21 @@ pub enum AgentEvent {
     },
     /// Run was cancelled by the user.
     Cancelled,
-    /// Error occurred
-    Error { message: String },
+    /// Error occurred.
+    ///
+    /// `code` and `details` are additive (P0-3, OpenAI 兼容链路鲁棒性计划):
+    /// a stable machine-readable classification from
+    /// `crate::llm::error_class::ErrorClass::code()` (e.g. `model_unavailable`,
+    /// `tool_args_invalid`, `protocol_error`) plus optional structured
+    /// context. Both are `#[serde(default)]` so older persisted events /
+    /// consumers that only know about `message` keep working unchanged.
+    Error {
+        message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        details: Option<serde_json::Value>,
+    },
     /// Visible plan/todo list for the current task
     PlanUpdate { items: Vec<PlanTodoItem> },
     /// Interactive UI card for the user to fill in (chat_ui tool).
@@ -110,6 +123,22 @@ pub enum AgentEvent {
     },
     /// Resume waiting for user submit on an existing card (chat_ui_listen tool).
     InteractiveUiListen { request_id: String },
+    /// Non-terminal, informational notice (P0-3 / P1-2, OpenAI 兼容链路鲁棒性计划).
+    ///
+    /// Unlike `Error`, receiving a `Notice` does NOT mean the run has
+    /// stopped or failed — the agent loop is continuing (e.g. it silently
+    /// switched to a fallback model, or is retrying once after a malformed
+    /// tool-call JSON). Frontends should surface this as a transient,
+    /// dismissible banner and must NOT clear the "running"/streaming state
+    /// because of it. `code` mirrors `Error.code` for known cases such as
+    /// `model_fallback` and `tool_args_invalid`.
+    Notice {
+        message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        details: Option<serde_json::Value>,
+    },
     /// A sub-agent (Fish) is executing — forwarded to the parent session so the user
     /// can see real-time progress without switching sessions.
     FishProgress {

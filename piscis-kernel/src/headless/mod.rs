@@ -347,7 +347,7 @@ pub async fn run_piscis_turn_cancellable(
                 AgentEvent::TextDelta { delta } => {
                     text.push_str(&delta);
                 }
-                AgentEvent::Error { message } => {
+                AgentEvent::Error { message, .. } => {
                     errored = Some(message);
                 }
                 AgentEvent::Done { .. } => break,

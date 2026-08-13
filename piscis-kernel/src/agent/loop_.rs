@@ -1850,16 +1850,16 @@ fn is_context_overflow_error(msg: &str) -> bool {
 }
 
 /// Returns true if the error indicates the model is permanently unavailable
-/// and a fallback model should be tried instead.
+/// (or provider-side rate limited) and a fallback model should be tried
+/// instead.
 /// Note: "overloaded" is intentionally excluded — it is transient and should
 /// be retried with exponential backoff on the same model, not switched away from.
+///
+/// Delegates to [`crate::llm::error_class::classify_error`] so the fallback
+/// decision, `AgentEvent::Error.code`, and downstream UI/log consumers all
+/// agree on the same classification (see docs/plans OpenAI 兼容链路鲁棒性).
 fn is_fallback_eligible_error(msg: &str) -> bool {
-    let lower = msg.to_lowercase();
-    lower.contains("rate_limit")
-        || lower.contains("rate limit")
-        || lower.contains("model_not_found")
-        || lower.contains("model not found")
-        || lower.contains("does not exist")
+    crate::llm::error_class::classify_error(msg).is_fallback_eligible()
 }
 
 /// Unified entry point for the per-iteration LLM call. When
@@ -2850,7 +2850,7 @@ impl AgentLoop {
         let mut last_turn_had_tool_calls = false;
         let mut last_turn_text = String::new();
 
-        for _iteration in 0..max_iterations {
+        'iterations: for _iteration in 0..max_iterations {
             if cancel.load(Ordering::Relaxed) {
                 break;
             }
@@ -3055,7 +3055,11 @@ impl AgentLoop {
             // updates `messages`, the next attempt uses the compacted context.
             info!("calling LLM: model={}", self.model);
             let mut cancelled_partial_text: Option<String> = None;
-            let response = {
+            // Caps the "please resend the full tool call JSON" corrective
+            // retry (P0-2) to at most one attempt per iteration, so a model
+            // that keeps truncating its output cannot loop forever.
+            let mut tool_args_correction_attempted = false;
+            let response = 'attempt_with_correction: loop {
                 // Loop-strategy next-turn hint may override the primary model
                 // for this iteration (default: no override).
                 let primary_model = self
@@ -3071,11 +3075,12 @@ impl AgentLoop {
                             .model
                     })
                     .unwrap_or_else(|| self.model.clone());
-                let models_to_try: Vec<String> = std::iter::once(primary_model)
+                let models_to_try: Vec<String> = std::iter::once(primary_model.clone())
                     .chain(self.fallback_models.iter().cloned())
                     .collect();
                 let mut last_err: Option<anyhow::Error> = None;
                 let mut resp: Option<crate::llm::LlmResponse> = None;
+                let mut succeeded_model: Option<String> = None;
                 let mut context_overflow_attempted = false;
 
                 'model_loop: for model_candidate in &models_to_try {
@@ -3212,11 +3217,20 @@ impl AgentLoop {
                         match llm_result {
                             Ok(r) => {
                                 resp = Some(r);
+                                succeeded_model = Some(model_candidate.clone());
                                 break 'model_loop;
                             }
                             Err(e) => {
                                 let msg = e.to_string();
+                                // P1-3 observability: structured fields so failures are
+                                // greppable/alertable without parsing free-text messages.
+                                let attempt_error_code =
+                                    crate::llm::error_class::classify_error(&msg).code();
                                 warn!(
+                                    model = %model_candidate,
+                                    attempt = attempt + 1,
+                                    max_attempts = LLM_MAX_RETRIES,
+                                    error_code = attempt_error_code,
                                     "LLM call attempt {}/{} model={} failed: {}",
                                     attempt + 1,
                                     LLM_MAX_RETRIES,
@@ -3332,6 +3346,11 @@ impl AgentLoop {
                                     // rate_limit / model_not_found: try next fallback model.
                                     // overloaded is intentionally excluded — it should be
                                     // retried with backoff on the same model.
+                                    info!(
+                                        fallback_from = %model_candidate,
+                                        error_code = attempt_error_code,
+                                        "abandoning model after fallback-eligible error, trying next candidate"
+                                    );
                                     last_err = Some(e);
                                     break;
                                 } else {
@@ -3375,7 +3394,35 @@ impl AgentLoop {
                     }
                 }
                 match resp {
-                    Some(r) => r,
+                    Some(r) => {
+                        // P1-2 lock-in decision: switching away from the primary
+                        // model must never be silent. Disclose "A → B" via a
+                        // non-terminal Notice (does not touch running/streaming
+                        // UI state) whenever the model that actually answered
+                        // isn't the one the caller originally asked for.
+                        if let Some(ref used_model) = succeeded_model {
+                            if used_model != &primary_model {
+                                info!(
+                                    "model fallback: primary={} used={}",
+                                    primary_model, used_model
+                                );
+                                let _ = event_tx
+                                    .send(AgentEvent::Notice {
+                                        message: format!(
+                                            "主模型「{}」当前不可用，已自动切换到备选模型「{}」继续为你处理。",
+                                            primary_model, used_model
+                                        ),
+                                        code: Some("model_fallback".to_string()),
+                                        details: Some(serde_json::json!({
+                                            "from": primary_model,
+                                            "to": used_model,
+                                        })),
+                                    })
+                                    .await;
+                            }
+                        }
+                        break 'attempt_with_correction r;
+                    }
                     None => {
                         // If cancelled, break the outer iteration loop cleanly
                         if cancel.load(Ordering::Relaxed) {
@@ -3389,12 +3436,60 @@ impl AgentLoop {
                                 self.persist_message(&ctx.session_id, &asst_msg, turn_index)
                                     .await;
                             }
-                            break;
+                            break 'iterations;
                         }
                         let err = last_err.unwrap_or_else(|| anyhow::anyhow!("LLM call failed"));
+                        let msg = err.to_string();
+                        let error_class = crate::llm::error_class::classify_error(&msg);
+
+                        // P0-2: a truncated/malformed tool-call `arguments` JSON is
+                        // never silently executed (see llm::openai) and never
+                        // silently retried forever either. Give the model exactly
+                        // one chance, in the SAME iteration, to resend a complete
+                        // and valid call before treating it as a hard failure.
+                        if !tool_args_correction_attempted
+                            && error_class == crate::llm::error_class::ErrorClass::ToolArgsInvalid
+                        {
+                            tool_args_correction_attempted = true;
+                            warn!(
+                                "tool_args_invalid on iteration {}: requesting one corrective retry: {}",
+                                _iteration, msg
+                            );
+                            let corrective = LlmMessage {
+                                role: "user".into(),
+                                content: MessageContent::text(
+                                    "系统提示：你上一次的工具调用参数(arguments) JSON 不完整或无法解析，\
+                                     因此未被执行，也没有产生任何副作用。请重新完整输出这次工具调用\
+                                     （不要截断、不要省略字段）；如内容较长，可考虑拆分为多次更短的调用。",
+                                ),
+                            };
+                            new_messages.push(corrective.clone());
+                            messages.push(corrective.clone());
+                            self.persist_message(&ctx.session_id, &corrective, turn_index)
+                                .await;
+                            // Notice, not Error: the run is NOT stopping — we're
+                            // about to retry in this same iteration. Sending
+                            // `Error` here would make frontends (which treat
+                            // Error as terminal) clear the running/streaming
+                            // state out from under an in-flight retry.
+                            let _ = event_tx
+                                .send(AgentEvent::Notice {
+                                    message: format!(
+                                        "工具调用参数不完整，已请求模型重新输出（自动纠偏 1 次）：{}",
+                                        msg
+                                    ),
+                                    code: Some(error_class.code().to_string()),
+                                    details: None,
+                                })
+                                .await;
+                            continue 'attempt_with_correction;
+                        }
+
                         let _ = event_tx
                             .send(AgentEvent::Error {
                                 message: err.to_string(),
+                                code: Some(error_class.code().to_string()),
+                                details: None,
                             })
                             .await;
                         return Err(err);
@@ -4241,7 +4336,7 @@ mod tests {
     use super::{
         build_request_messages, compact_summarise, compact_trim_tool_results, confirm_flags_handle,
         is_structural_schema_error, maybe_schema_correction_envelope,
-        serialize_tool_results_with_receipts, AgentLoop, CTX_KEEP_RECENT_TOOL_CARRIERS,
+        serialize_tool_results_with_receipts, AgentEvent, AgentLoop, CTX_KEEP_RECENT_TOOL_CARRIERS,
         CTX_PRESERVE_RECENT_TURNS, CTX_TRIM_HEAD, CTX_TRIM_TAIL,
     };
     use crate::agent::tool::{Tool, ToolContext, ToolRegistry, ToolSettings};
@@ -4250,7 +4345,7 @@ mod tests {
     use anyhow::Result;
     use async_trait::async_trait;
     use serde_json::{json, Value};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::{borrow::Cow, collections::HashMap, path::PathBuf, sync::Arc};
 
     // ── Mock LLM clients ──────────────────────────────────────────────────────
@@ -4439,6 +4534,242 @@ mod tests {
         assert!(messages.iter().any(|message| {
             message.role == "assistant" && message.content.as_text() == "partial answer"
         }));
+    }
+
+    /// Fails the first `complete()` call with a `tool_args_invalid`-classified
+    /// error, then succeeds with plain text on the second — simulates a model
+    /// that truncates a tool call once and then answers normally after the
+    /// P0-2 corrective retry.
+    struct CorrectiveRetryClient {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl crate::llm::LlmClient for CorrectiveRetryClient {
+        async fn stream(
+            &self,
+            _req: LlmRequest,
+            _tx: tokio::sync::mpsc::Sender<LlmChunk>,
+        ) -> Result<()> {
+            unreachable!("this test drives the non-streaming path")
+        }
+
+        async fn complete(&self, _req: LlmRequest) -> Result<LlmResponse> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                Err(anyhow::anyhow!(
+                    "tool_args_invalid: failed to parse arguments for tool \"file_write\" \
+                     (id=call_1, args_len=5): EOF while parsing a string"
+                ))
+            } else {
+                Ok(LlmResponse {
+                    content: "已完成".into(),
+                    tool_calls: vec![],
+                    input_tokens: 5,
+                    output_tokens: 5,
+                })
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_args_invalid_gets_one_corrective_retry_then_succeeds() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let agent = AgentLoop {
+            client: Box::new(CorrectiveRetryClient {
+                calls: calls.clone(),
+            }),
+            registry: Arc::new(ToolRegistry::new()),
+            policy: Arc::new(PolicyGate::new(PathBuf::from("."))),
+            system_prompt: String::new(),
+            model: "test-model".into(),
+            max_tokens: 1024,
+            context_window: 8192,
+            fallback_models: vec![],
+            db: None,
+            plan_state: None,
+            confirmation_responses: None,
+            confirm_flags: confirm_flags_handle(false, false),
+            vision_override: Some(false),
+            vision_delegate: None,
+            vision_model: String::new(),
+            notification_rx: None,
+            auto_compact_input_tokens_threshold: 0,
+            enable_streaming: false,
+            hooks: None,
+            compaction_strategy: Arc::new(super::DefaultCompaction),
+            memory_plugin: None,
+            context_manager: None,
+            memory_retrieval_prompt: None,
+            loop_strategy: None,
+        };
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(32);
+        let ctx = ToolContext {
+            session_id: "tool-args-invalid-test".into(),
+            workspace_root: PathBuf::from("."),
+            bypass_permissions: false,
+            settings: Arc::new(ToolSettings::default()),
+            max_iterations: Some(2),
+            memory_owner_id: "piscis".into(),
+            pool_session_id: None,
+            tool_use_id: None,
+            cancel: cancel.clone(),
+            loop_halt: None,
+        };
+
+        let events_task = tokio::spawn(async move {
+            let mut events = Vec::new();
+            while let Some(ev) = event_rx.recv().await {
+                events.push(ev);
+            }
+            events
+        });
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            agent.run(vec![make_text_msg("user", "写个文件")], event_tx, cancel, ctx),
+        )
+        .await
+        .expect("agent run should not hang");
+        result.expect("run should succeed after exactly one corrective retry");
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "expected the primary call plus exactly one corrective retry"
+        );
+
+        let events = events_task.await.expect("event collector should not panic");
+        let notice = events.iter().find_map(|e| match e {
+            AgentEvent::Notice { message, code, .. } => Some((message.clone(), code.clone())),
+            _ => None,
+        });
+        let (notice_msg, notice_code) =
+            notice.expect("expected a non-terminal Notice event for the corrective retry");
+        assert_eq!(notice_code, Some("tool_args_invalid".to_string()));
+        assert!(notice_msg.contains("tool_args_invalid"));
+
+        // The run ultimately succeeded — must NOT have emitted a terminal
+        // Error for the transient tool_args_invalid failure that was retried.
+        assert!(!events.iter().any(|e| matches!(e, AgentEvent::Error { .. })));
+    }
+
+    /// Fails `complete()` for the primary model with a `model_unavailable`-
+    /// classified error, and only succeeds when called with `fallback_model`.
+    struct FallbackModelClient {
+        fallback_model: String,
+    }
+
+    #[async_trait]
+    impl crate::llm::LlmClient for FallbackModelClient {
+        async fn stream(
+            &self,
+            _req: LlmRequest,
+            _tx: tokio::sync::mpsc::Sender<LlmChunk>,
+        ) -> Result<()> {
+            unreachable!("this test drives the non-streaming path")
+        }
+
+        async fn complete(&self, req: LlmRequest) -> Result<LlmResponse> {
+            if req.model == self.fallback_model {
+                Ok(LlmResponse {
+                    content: "已用备选模型完成".into(),
+                    tool_calls: vec![],
+                    input_tokens: 5,
+                    output_tokens: 5,
+                })
+            } else {
+                Err(anyhow::anyhow!(
+                    "OpenAI API error 404 Not Found: {{\"error\":{{\"message\":\"Model \\\"{}\\\" is not supported by any configured account in this group\",\"type\":\"model_not_found\"}}}}",
+                    req.model
+                ))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn primary_model_unavailable_falls_back_and_discloses_switch() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let fallback_model = "fallback-model".to_string();
+        let agent = AgentLoop {
+            client: Box::new(FallbackModelClient {
+                fallback_model: fallback_model.clone(),
+            }),
+            registry: Arc::new(ToolRegistry::new()),
+            policy: Arc::new(PolicyGate::new(PathBuf::from("."))),
+            system_prompt: String::new(),
+            model: "primary-model".into(),
+            max_tokens: 1024,
+            context_window: 8192,
+            fallback_models: vec![fallback_model.clone()],
+            db: None,
+            plan_state: None,
+            confirmation_responses: None,
+            confirm_flags: confirm_flags_handle(false, false),
+            vision_override: Some(false),
+            vision_delegate: None,
+            vision_model: String::new(),
+            notification_rx: None,
+            auto_compact_input_tokens_threshold: 0,
+            enable_streaming: false,
+            hooks: None,
+            compaction_strategy: Arc::new(super::DefaultCompaction),
+            memory_plugin: None,
+            context_manager: None,
+            memory_retrieval_prompt: None,
+            loop_strategy: None,
+        };
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(32);
+        let ctx = ToolContext {
+            session_id: "model-fallback-test".into(),
+            workspace_root: PathBuf::from("."),
+            bypass_permissions: false,
+            settings: Arc::new(ToolSettings::default()),
+            max_iterations: Some(1),
+            memory_owner_id: "piscis".into(),
+            pool_session_id: None,
+            tool_use_id: None,
+            cancel: cancel.clone(),
+            loop_halt: None,
+        };
+
+        let events_task = tokio::spawn(async move {
+            let mut events = Vec::new();
+            while let Some(ev) = event_rx.recv().await {
+                events.push(ev);
+            }
+            events
+        });
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            agent.run(vec![make_text_msg("user", "hi")], event_tx, cancel, ctx),
+        )
+        .await
+        .expect("agent run should not hang");
+        result.expect("run should succeed via the fallback model");
+
+        let events = events_task.await.expect("event collector should not panic");
+        let notice = events.iter().find_map(|e| match e {
+            AgentEvent::Notice {
+                message,
+                code,
+                details,
+            } => Some((message.clone(), code.clone(), details.clone())),
+            _ => None,
+        });
+        let (notice_msg, notice_code, details) =
+            notice.expect("expected a Notice disclosing the model_fallback switch");
+        assert_eq!(notice_code, Some("model_fallback".to_string()));
+        assert!(notice_msg.contains("primary-model"));
+        assert!(notice_msg.contains(&fallback_model));
+        let details = details.expect("model_fallback notice should carry from/to details");
+        assert_eq!(details["from"], "primary-model");
+        assert_eq!(details["to"], fallback_model);
+
+        // A successful fallback is not a terminal failure.
+        assert!(!events.iter().any(|e| matches!(e, AgentEvent::Error { .. })));
     }
 
     /// Assistant message with a ToolUse block (mirrors real DB tool_calls_json).

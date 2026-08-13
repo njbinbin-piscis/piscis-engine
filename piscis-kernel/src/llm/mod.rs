@@ -1,5 +1,7 @@
 pub mod claude;
 pub mod deepseek;
+pub mod error_class;
+pub mod json_repair;
 pub mod kimi;
 pub mod minimax;
 pub mod openai;

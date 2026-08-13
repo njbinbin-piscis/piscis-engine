@@ -51,6 +51,59 @@ pub fn model_supports_vision(model: &str) -> bool {
         || m.contains("abab6.5")
 }
 
+/// Parse the `tool_calls` array of a non-streaming Chat Completions response
+/// message. Mirrors `parse_streamed_tool_call`'s "never fabricate `{}`"
+/// contract: a tool call whose `arguments` fails to parse gets one
+/// conservative repair attempt (P2-2, `json_repair`); if that also fails,
+/// it aborts the whole response with a classifiable `tool_args_invalid`
+/// error instead of returning a partially-fabricated `LlmResponse` that
+/// looks successful.
+fn parse_tool_calls(message: &Value) -> Result<Vec<ToolCall>> {
+    let mut tool_calls = Vec::new();
+    let Some(tcs) = message["tool_calls"].as_array() else {
+        return Ok(tool_calls);
+    };
+    for tc in tcs {
+        let id = tc["id"].as_str().unwrap_or("").to_string();
+        let name = tc["function"]["name"].as_str().unwrap_or("").to_string();
+        let args_str = tc["function"]["arguments"].as_str().unwrap_or("");
+        match serde_json::from_str::<Value>(args_str) {
+            Ok(input) => tool_calls.push(ToolCall { id, name, input }),
+            Err(parse_err) => {
+                let args_len = args_str.len();
+                // P2-2: one conservative repair attempt before giving up.
+                if let Some(input) = super::json_repair::try_conservative_repair(args_str) {
+                    tracing::warn!(
+                        "tool_args_invalid recovered via conservative JSON repair: tool={} id={} args_len={} parse_error={}",
+                        name,
+                        id,
+                        args_len,
+                        parse_err
+                    );
+                    tool_calls.push(ToolCall { id, name, input });
+                    continue;
+                }
+                tracing::warn!(
+                    "tool_args_invalid: tool={} id={} args_len={} parse_error={} args_preview={:?}",
+                    name,
+                    id,
+                    args_len,
+                    parse_err,
+                    args_str.chars().take(200).collect::<String>()
+                );
+                return Err(anyhow!(
+                    "tool_args_invalid: failed to parse arguments for tool \"{}\" (id={}, args_len={}): {}",
+                    name,
+                    id,
+                    args_len,
+                    parse_err
+                ));
+            }
+        }
+    }
+    Ok(tool_calls)
+}
+
 fn is_dashscope_qwen_endpoint(base_url: &str, model: &str) -> bool {
     let url = base_url.to_lowercase();
     let model = model.to_lowercase();
@@ -60,6 +113,79 @@ fn is_dashscope_qwen_endpoint(base_url: &str, model: &str) -> bool {
 fn is_deepseek_thinking_model(model: &str) -> bool {
     let model = model.to_lowercase();
     model.contains("deepseek-v4") || model.contains("deepseek-reasoner")
+}
+
+/// Parse a single accumulated tool-call's `arguments` buffer into a chunk to
+/// forward to the caller. Never silently substitutes `{}` on a parse
+/// failure (see plan "OpenAI 兼容链路鲁棒性" P0-2) — truncated/malformed
+/// `arguments` JSON (e.g. cut off mid-stream, or genuinely empty because the
+/// model never sent any) must surface as an explicit, classifiable error so
+/// the agent loop never executes a tool call with fabricated input.
+fn parse_streamed_tool_call(id: String, name: String, args_buf: String) -> LlmChunk {
+    match serde_json::from_str::<Value>(&args_buf) {
+        Ok(input) => LlmChunk::ToolUse { id, name, input },
+        Err(parse_err) => {
+            let args_len = args_buf.len();
+            // P2-2: one conservative repair attempt (rebalance brackets /
+            // close an unterminated string) before giving up. Never
+            // fabricates field content — see `llm::json_repair`.
+            if let Some(input) = super::json_repair::try_conservative_repair(&args_buf) {
+                tracing::warn!(
+                    "tool_args_invalid recovered via conservative JSON repair: tool={} id={} args_len={} parse_error={}",
+                    name,
+                    id,
+                    args_len,
+                    parse_err
+                );
+                return LlmChunk::ToolUse { id, name, input };
+            }
+            let preview: String = args_buf.chars().take(200).collect();
+            tracing::warn!(
+                "tool_args_invalid: tool={} id={} args_len={} parse_error={} args_preview={:?}",
+                name,
+                id,
+                args_len,
+                parse_err,
+                preview
+            );
+            LlmChunk::Error(format!(
+                "tool_args_invalid: failed to parse arguments for tool \"{}\" (id={}, args_len={}): {}",
+                name, id, args_len, parse_err
+            ))
+        }
+    }
+}
+
+/// Drain all buffered streamed tool calls, sending a `ToolUse` chunk for
+/// each one that parses cleanly and an `Error` chunk (never a silent `{}`)
+/// for each one that doesn't.
+async fn emit_buffered_tool_calls(
+    tool_bufs: &mut std::collections::HashMap<usize, (String, String, String)>,
+    tx: &Sender<LlmChunk>,
+) {
+    for (_, (id, name, args_buf)) in tool_bufs.drain() {
+        let _ = tx.send(parse_streamed_tool_call(id, name, args_buf)).await;
+    }
+}
+
+/// Build the `protocol_error` message for a stream that ended (no more SSE
+/// bytes, connection closed) while one or more tool calls were still
+/// buffered — i.e. it never reached `[DONE]` or a `finish_reason` that would
+/// have triggered a drain. Dropping these silently would look like the
+/// model simply chose not to call any tool, hiding a real failure.
+fn undrained_tool_bufs_message(
+    tool_bufs: &std::collections::HashMap<usize, (String, String, String)>,
+) -> String {
+    let pending: Vec<String> = tool_bufs
+        .values()
+        .map(|(id, name, args_buf)| format!("{}(id={}, args_len={})", name, id, args_buf.len()))
+        .collect();
+    format!(
+        "protocol_error: stream ended with {} undrained tool call(s) still buffered [{}] — \
+         the connection likely closed mid tool-call",
+        tool_bufs.len(),
+        pending.join(", ")
+    )
 }
 
 impl OpenAiClient {
@@ -81,6 +207,24 @@ impl OpenAiClient {
             base_url: base_url.trim_end_matches('/').to_string(),
             http,
         }
+    }
+
+    /// Build the error for a non-2xx HTTP response and, in the same place,
+    /// emit the structured log line consumers can grep/alert on (P1-3,
+    /// observability): `model`, `http_status`, `error_code`. The returned
+    /// `anyhow::Error`'s `Display` text is unchanged (`"OpenAI API error
+    /// {status}: {body}"`) so `error_class::classify_error` and existing
+    /// callers keep working on the flattened string.
+    fn api_error(model: &str, status: reqwest::StatusCode, text: &str) -> anyhow::Error {
+        let msg = format!("OpenAI API error {}: {}", status, text);
+        let class = crate::llm::error_class::classify_error(&msg);
+        tracing::warn!(
+            model = model,
+            http_status = status.as_u16(),
+            error_code = class.code(),
+            "OpenAI-compatible API returned an error response"
+        );
+        anyhow!(msg)
     }
 
     fn request_send_error(url: &str, err: reqwest::Error) -> anyhow::Error {
@@ -739,7 +883,7 @@ impl LlmClient for OpenAiClient {
             let status = response.status();
             let text = response.text().await.unwrap_or_default();
             Self::log_400_diagnostic(status, &body, &req_stream.model, &url, &text);
-            return Err(anyhow!("OpenAI API error {}: {}", status, text));
+            return Err(Self::api_error(&req_stream.model, status, &text));
         }
 
         let mut stream = response.bytes_stream();
@@ -749,6 +893,13 @@ impl LlmClient for OpenAiClient {
             std::collections::HashMap::new();
         let mut input_tokens = 0u32;
         let mut output_tokens = 0u32;
+        // P2-1: distinguishes "the stream ended having produced nothing at
+        // all" (almost certainly a dropped connection before the response
+        // even started) from "the stream ended after delivering real
+        // content but without an explicit [DONE]" (some OpenAI-compatible
+        // providers omit it once everything has already been sent) — only
+        // the former is flagged as `protocol_error`.
+        let mut any_output_sent = false;
 
         while let Some(chunk) = stream.next().await {
             let chunk = match chunk {
@@ -768,11 +919,7 @@ impl LlmClient for OpenAiClient {
                 if let Some(data) = line.strip_prefix("data: ") {
                     if data == "[DONE]" {
                         // Drain any tool calls that arrived before [DONE]
-                        for (_, (id, name, args_buf)) in tool_bufs.drain() {
-                            let input = serde_json::from_str(&args_buf)
-                                .unwrap_or(Value::Object(serde_json::Map::new()));
-                            let _ = tx.send(LlmChunk::ToolUse { id, name, input }).await;
-                        }
+                        emit_buffered_tool_calls(&mut tool_bufs, &tx).await;
                         let _ = tx
                             .send(LlmChunk::Done {
                                 input_tokens,
@@ -795,6 +942,7 @@ impl LlmClient for OpenAiClient {
                                 // Text delta
                                 if let Some(text) = delta["content"].as_str() {
                                     if !text.is_empty() {
+                                        any_output_sent = true;
                                         let _ =
                                             tx.send(LlmChunk::TextDelta(text.to_string())).await;
                                     }
@@ -803,6 +951,7 @@ impl LlmClient for OpenAiClient {
                                 // Tool calls
                                 if let Some(tool_calls) = delta["tool_calls"].as_array() {
                                     for tc in tool_calls {
+                                        any_output_sent = true;
                                         let idx = tc["index"].as_u64().unwrap_or(0) as usize;
                                         let entry = tool_bufs.entry(idx).or_insert_with(|| {
                                             let id = tc["id"].as_str().unwrap_or("").to_string();
@@ -820,18 +969,35 @@ impl LlmClient for OpenAiClient {
 
                                 // Finish reason
                                 if let Some("tool_calls") = choice["finish_reason"].as_str() {
-                                    for (_, (id, name, args_buf)) in tool_bufs.drain() {
-                                        let input = serde_json::from_str(&args_buf)
-                                            .unwrap_or(Value::Object(serde_json::Map::new()));
-                                        let _ =
-                                            tx.send(LlmChunk::ToolUse { id, name, input }).await;
-                                    }
+                                    emit_buffered_tool_calls(&mut tool_bufs, &tx).await;
                                 }
                             }
                         }
                     }
                 }
             }
+        }
+
+        // The HTTP body ended without a `[DONE]` sentinel or a `finish_reason`
+        // that would have drained `tool_bufs`. Silently returning `Ok(())` here
+        // would look like the model produced a normal, tool-free response —
+        // hiding a real mid-stream failure. Surface it explicitly instead.
+        if !tool_bufs.is_empty() {
+            let msg = undrained_tool_bufs_message(&tool_bufs);
+            tracing::warn!("{}", msg);
+            let _ = tx.send(LlmChunk::Error(msg.clone())).await;
+            return Err(anyhow!(msg));
+        }
+
+        // The connection closed before delivering a single text delta, tool
+        // call, or [DONE] — the model never got a chance to say anything.
+        // This is functionally the streaming equivalent of the non-streaming
+        // path's "OpenAI response returned empty choices" check below.
+        if !any_output_sent {
+            let msg = "protocol_error: stream ended with no text, no tool calls, and no [DONE] sentinel — connection likely closed before the response started".to_string();
+            tracing::warn!("{}", msg);
+            let _ = tx.send(LlmChunk::Error(msg.clone())).await;
+            return Err(anyhow!(msg));
         }
 
         Ok(())
@@ -856,7 +1022,7 @@ impl LlmClient for OpenAiClient {
             let status = response.status();
             let text = response.text().await.unwrap_or_default();
             Self::log_400_diagnostic(status, &body, &req_no_stream.model, &url, &text);
-            return Err(anyhow!("OpenAI API error {}: {}", status, text));
+            return Err(Self::api_error(&req_no_stream.model, status, &text));
         }
 
         let body = response.bytes().await?;
@@ -877,19 +1043,7 @@ impl LlmClient for OpenAiClient {
         let message = &choices[0]["message"];
         let text = message["content"].as_str().unwrap_or("").to_string();
 
-        let mut tool_calls = Vec::new();
-        if let Some(tcs) = message["tool_calls"].as_array() {
-            for tc in tcs {
-                let args_str = tc["function"]["arguments"].as_str().unwrap_or("{}");
-                let input =
-                    serde_json::from_str(args_str).unwrap_or(Value::Object(serde_json::Map::new()));
-                tool_calls.push(ToolCall {
-                    id: tc["id"].as_str().unwrap_or("").to_string(),
-                    name: tc["function"]["name"].as_str().unwrap_or("").to_string(),
-                    input,
-                });
-            }
-        }
+        let tool_calls = parse_tool_calls(message)?;
 
         Ok(LlmResponse {
             content: text,
@@ -952,6 +1106,188 @@ mod tests {
         let body = client.build_body(&request_for_model("deepseek-chat"));
 
         assert!(body.get("thinking").is_none());
+    }
+
+    #[test]
+    fn streamed_tool_call_valid_json_yields_tool_use() {
+        let chunk = parse_streamed_tool_call(
+            "call_1".into(),
+            "file_write".into(),
+            r#"{"path":"a.txt","content":"hi"}"#.into(),
+        );
+        match chunk {
+            LlmChunk::ToolUse { id, name, input } => {
+                assert_eq!(id, "call_1");
+                assert_eq!(name, "file_write");
+                assert_eq!(input["path"], "a.txt");
+            }
+            other => panic!("expected ToolUse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn streamed_tool_call_unrepairable_truncation_yields_error_not_empty_object() {
+        // Cut off right after a key's colon, with no value at all — the
+        // P2-2 conservative repair explicitly refuses to guess a value here
+        // ("不做字段脑补"), so this must still surface as tool_args_invalid,
+        // and must NOT become `{}`.
+        let chunk = parse_streamed_tool_call(
+            "call_2".into(),
+            "file_write".into(),
+            r#"{"path":"a.txt","content":"#.into(),
+        );
+        match chunk {
+            LlmChunk::Error(msg) => {
+                assert!(msg.contains("tool_args_invalid"), "msg={msg}");
+                assert!(msg.contains("file_write"), "msg={msg}");
+                assert!(msg.contains("call_2"), "msg={msg}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn streamed_tool_call_repairable_truncation_recovers_via_json_repair() {
+        // P2-2: a string value cut off mid-stream is exactly the case the
+        // conservative repair handles — it must recover with the verbatim
+        // (truncated) content, not error out and not invent anything extra.
+        let chunk = parse_streamed_tool_call(
+            "call_2".into(),
+            "file_write".into(),
+            r#"{"path":"a.txt","content":"this got cut of"#.into(),
+        );
+        match chunk {
+            LlmChunk::ToolUse { id, name, input } => {
+                assert_eq!(id, "call_2");
+                assert_eq!(name, "file_write");
+                assert_eq!(input["path"], "a.txt");
+                assert_eq!(input["content"], "this got cut of");
+            }
+            other => panic!("expected repaired ToolUse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn streamed_tool_call_empty_args_yields_error_not_empty_object() {
+        // A tool call whose arguments never arrived at all (e.g. the model
+        // emitted the call but the connection dropped before any argument
+        // deltas) must be flagged, not treated as "no arguments" == `{}`.
+        let chunk = parse_streamed_tool_call("call_3".into(), "search".into(), String::new());
+        assert!(matches!(chunk, LlmChunk::Error(ref m) if m.contains("tool_args_invalid")));
+    }
+
+    #[tokio::test]
+    async fn emit_buffered_tool_calls_sends_error_for_bad_and_tooluse_for_good() {
+        let mut bufs = std::collections::HashMap::new();
+        bufs.insert(
+            0usize,
+            (
+                "good".to_string(),
+                "search".to_string(),
+                r#"{"query":"x"}"#.to_string(),
+            ),
+        );
+        bufs.insert(
+            1usize,
+            ("bad".to_string(), "file_write".to_string(), "{broken".to_string()),
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        emit_buffered_tool_calls(&mut bufs, &tx).await;
+        drop(tx);
+
+        let mut saw_tool_use = false;
+        let mut saw_error = false;
+        while let Some(chunk) = rx.recv().await {
+            match chunk {
+                LlmChunk::ToolUse { name, .. } if name == "search" => saw_tool_use = true,
+                LlmChunk::Error(msg) if msg.contains("tool_args_invalid") => saw_error = true,
+                other => panic!("unexpected chunk: {other:?}"),
+            }
+        }
+        assert!(saw_tool_use && saw_error);
+        assert!(bufs.is_empty());
+    }
+
+    #[test]
+    fn undrained_tool_bufs_message_names_pending_calls() {
+        let mut bufs = std::collections::HashMap::new();
+        bufs.insert(
+            0usize,
+            (
+                "call_x".to_string(),
+                "file_write".to_string(),
+                "{\"path\":".to_string(),
+            ),
+        );
+        let msg = undrained_tool_bufs_message(&bufs);
+        assert!(msg.contains("protocol_error"));
+        assert!(msg.contains("file_write"));
+        assert!(msg.contains("call_x"));
+    }
+
+    #[test]
+    fn parse_tool_calls_valid_json() {
+        let message = json!({
+            "tool_calls": [{
+                "id": "call_1",
+                "function": { "name": "search", "arguments": "{\"query\":\"piscis\"}" }
+            }]
+        });
+        let calls = parse_tool_calls(&message).expect("should parse");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "search");
+        assert_eq!(calls[0].input["query"], "piscis");
+    }
+
+    #[test]
+    fn parse_tool_calls_unrepairable_truncation_errs_instead_of_defaulting() {
+        // Cut off right after a colon — repair explicitly refuses to guess
+        // the missing value ("不做字段脑补"), so this must still error.
+        let message = json!({
+            "tool_calls": [{
+                "id": "call_2",
+                "function": { "name": "file_write", "arguments": "{\"path\":\"a.txt\",\"content\":" }
+            }]
+        });
+        let err = parse_tool_calls(&message).expect_err("should error, not default to {}");
+        let msg = err.to_string();
+        assert!(msg.contains("tool_args_invalid"), "msg={msg}");
+        assert!(msg.contains("file_write"), "msg={msg}");
+    }
+
+    #[test]
+    fn parse_tool_calls_repairable_truncation_recovers_via_json_repair() {
+        // P2-2: a string value cut off mid-stream is repaired, not rejected.
+        let message = json!({
+            "tool_calls": [{
+                "id": "call_2",
+                "function": { "name": "file_write", "arguments": "{\"path\":\"a.txt\",\"content\":\"cut of" }
+            }]
+        });
+        let calls = parse_tool_calls(&message).expect("should recover via repair");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].input["path"], "a.txt");
+        assert_eq!(calls[0].input["content"], "cut of");
+    }
+
+    #[test]
+    fn parse_tool_calls_empty_arguments_errs() {
+        let message = json!({
+            "tool_calls": [{
+                "id": "call_3",
+                "function": { "name": "search" }
+            }]
+        });
+        let err = parse_tool_calls(&message).expect_err("missing arguments must error");
+        assert!(err.to_string().contains("tool_args_invalid"));
+    }
+
+    #[test]
+    fn parse_tool_calls_no_tool_calls_field_returns_empty() {
+        let message = json!({ "content": "just text" });
+        let calls = parse_tool_calls(&message).expect("should not error");
+        assert!(calls.is_empty());
     }
 
     #[test]

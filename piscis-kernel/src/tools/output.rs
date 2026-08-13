@@ -15,6 +15,11 @@ pub enum ToolErrorCode {
     PermissionDenied,
     InvalidInput,
     OutputTooLarge,
+    /// A tool *input* parameter (e.g. `file_write`'s `content`) exceeds the
+    /// size this tool is willing to accept in one call — distinct from
+    /// `OutputTooLarge`, which is about truncating a large *result* rather
+    /// than refusing to run at all (P2-3, OpenAI 兼容链路鲁棒性计划).
+    ContentTooLarge,
     ExternalCommandFailed,
     Other,
 }
@@ -30,6 +35,7 @@ impl ToolErrorCode {
             Self::PermissionDenied => "permission_denied",
             Self::InvalidInput => "invalid_input",
             Self::OutputTooLarge => "output_too_large",
+            Self::ContentTooLarge => "content_too_large",
             Self::ExternalCommandFailed => "external_command_failed",
             Self::Other => "other",
         }
