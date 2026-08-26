@@ -69,21 +69,30 @@ fn is_stable_local_attachment_uri(uri: &str) -> bool {
         return is_valid_windows_drive_path(uri);
     }
     if looks_like_windows_unc_path(uri) {
-        return is_valid_windows_unc_path(uri);
+        if is_valid_windows_unc_path(uri) {
+            return true;
+        }
+        #[cfg(windows)]
+        return false;
+        #[cfg(not(windows))]
+        return Path::new(uri).is_absolute();
     }
 
     !has_uri_scheme(uri) && Path::new(uri).is_absolute()
 }
 
 fn is_valid_file_uri(uri: &str) -> bool {
-    if uri.chars().any(char::is_control)
-        || uri.contains(['?', '#', '\\'])
-        || !uri["file:".len()..].starts_with("//")
-    {
+    if uri.chars().any(char::is_control) || uri.contains(['?', '#', '\\']) {
         return false;
     }
 
-    let hierarchy = &uri[("file:".len() + 2)..];
+    let scheme_path = &uri["file:".len()..];
+    let Some(hierarchy) = scheme_path.strip_prefix("//") else {
+        let Some(path) = percent_decode_file_uri_path(scheme_path) else {
+            return false;
+        };
+        return is_valid_local_file_uri_path(&path);
+    };
     if hierarchy.starts_with('/') {
         let Some(path) = percent_decode_file_uri_path(hierarchy) else {
             return false;
@@ -98,7 +107,13 @@ fn is_valid_file_uri(uri: &str) -> bool {
     let Some(path) = percent_decode_file_uri_path(&hierarchy[path_start..]) else {
         return false;
     };
-    is_valid_file_uri_host(authority) && is_valid_file_uri_unc_path(&path)
+    if !is_valid_file_uri_host(authority) {
+        return false;
+    }
+    if authority.eq_ignore_ascii_case("localhost") {
+        return is_valid_local_file_uri_path(&path);
+    }
+    is_valid_file_uri_unc_path(&path)
 }
 
 fn percent_decode_file_uri_path(path: &str) -> Option<String> {
@@ -158,15 +173,33 @@ fn is_valid_local_file_uri_path(path: &str) -> bool {
 }
 
 fn is_valid_file_uri_host(host: &str) -> bool {
-    !host.is_empty()
-        && host.split('.').all(|label| {
-            !label.is_empty()
-                && !label.starts_with('-')
-                && !label.ends_with('-')
-                && label
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-        })
+    if let Some(ipv6) = host
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+    {
+        return ipv6.parse::<std::net::Ipv6Addr>().is_ok();
+    }
+    if host.contains(['[', ']', ':']) || host.is_empty() {
+        return false;
+    }
+    if host.parse::<std::net::Ipv4Addr>().is_ok() {
+        return true;
+    }
+    if host
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || byte == b'.')
+    {
+        return false;
+    }
+
+    host.split('.').all(|label| {
+        !label.is_empty()
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    })
 }
 
 fn is_valid_file_uri_unc_path(path: &str) -> bool {
@@ -238,6 +271,23 @@ fn is_valid_windows_component(component: &str) -> bool {
                     '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'
                 )
         })
+        && !is_windows_dos_device_component(component)
+}
+
+fn is_windows_dos_device_component(component: &str) -> bool {
+    let basename = component.split('.').next().unwrap_or_default();
+    if ["CON", "PRN", "AUX", "NUL", "CLOCK$"]
+        .iter()
+        .any(|device| basename.eq_ignore_ascii_case(device))
+    {
+        return true;
+    }
+
+    let uppercase = basename.to_ascii_uppercase();
+    let bytes = uppercase.as_bytes();
+    bytes.len() == 4
+        && (bytes.starts_with(b"COM") || bytes.starts_with(b"LPT"))
+        && matches!(bytes[3], b'1'..=b'9')
 }
 
 fn has_uri_scheme(value: &str) -> bool {
@@ -5687,6 +5737,12 @@ mod tests {
         let duplicate_uri = format!(
             r#"[{{"media_type":"application/pdf","filename":"report.pdf","uri":"C:/files/first.pdf","uri":"C:/files/second.pdf","size":1,"sha256":"{ATTACHMENT_SHA256}"}}]"#
         );
+        let duplicate_media_type = format!(
+            r#"[{{"media_type":"application/pdf","media_type":"image/png","filename":"report.pdf","uri":"C:/files/report.pdf","size":1,"sha256":"{ATTACHMENT_SHA256}"}}]"#
+        );
+        let duplicate_filename = format!(
+            r#"[{{"media_type":"application/pdf","filename":"first.pdf","filename":"second.pdf","uri":"C:/files/report.pdf","size":1,"sha256":"{ATTACHMENT_SHA256}"}}]"#
+        );
         let duplicate_size = format!(
             r#"[{{"media_type":"application/pdf","filename":"report.pdf","uri":"C:/files/report.pdf","size":1,"size":2,"sha256":"{ATTACHMENT_SHA256}"}}]"#
         );
@@ -5698,6 +5754,8 @@ mod tests {
         );
 
         for (label, attachments) in [
+            ("duplicate media_type", duplicate_media_type),
+            ("duplicate filename", duplicate_filename),
             ("duplicate uri", duplicate_uri),
             ("duplicate size", duplicate_size),
             ("duplicate sha256", duplicate_sha256),
@@ -5736,10 +5794,15 @@ mod tests {
             .into_owned();
 
         for uri in [
+            "file:/a".to_string(),
+            "file:/C:/a".to_string(),
             "file:///a".to_string(),
             "FiLe:///C:/files/local.bin".to_string(),
             "file:///a%20b".to_string(),
+            "file://localhost/C:/a".to_string(),
             "file://host/share/path".to_string(),
+            "file://127.0.0.1/share/path".to_string(),
+            "file://[::1]/share/path".to_string(),
             r"C:\files\local.bin".to_string(),
             r"\\host\share\local.bin".to_string(),
             platform_absolute,
@@ -5753,7 +5816,7 @@ mod tests {
                 .expect("read session")
                 .expect("session exists")
                 .message_count,
-            7
+            12
         );
     }
 
@@ -5770,11 +5833,15 @@ mod tests {
         for uri in [
             "file://host:445/share/path",
             "file://user@host/share/path",
+            "file://127.0.0.1:445/share/path",
+            "file://999.999.999.999/share/path",
+            "file://[:::1]/share/path",
+            "file://[::1]:445/share/path",
+            "file://[::1/share/path",
             r"file://host\share\path",
             "file://bad_host/share/path",
             "file://host",
             "file://host/",
-            "file:/a",
             "file:///a?token=secret",
             "file:///a#fragment",
             "file:///a%2",
@@ -5810,6 +5877,92 @@ mod tests {
                     .message_count,
                 0,
                 "{uri:?} must not update message_count"
+            );
+        }
+    }
+
+    #[test]
+    fn attachment_paths_reject_dos_device_basenames_without_writes() {
+        let db = Database::open_in_memory().expect("in-memory db");
+        let session = db.create_session(Some("DOS devices")).expect("session");
+
+        for uri in [
+            r"C:\NUL",
+            r"C:\CON.txt",
+            r"c:\prn.PDF",
+            r"C:\AUX",
+            r"C:\CLOCK$",
+            r"C:\COM1.bin",
+            r"C:\com9",
+            r"C:\LPT1.txt",
+            r"\\host\share\nul.txt",
+            "file:///C:/AUX",
+            "file://host/share/Lpt9.log",
+        ] {
+            let attachments = attachment_json(uri, "device.bin");
+            assert!(
+                db.append_message_with_attachments(&session.id, "user", uri, Some(&attachments))
+                    .is_err(),
+                "{uri:?} should reject a DOS device basename"
+            );
+            assert!(db
+                .get_messages(&session.id, 10, 0)
+                .expect("read messages")
+                .is_empty());
+            assert_eq!(
+                db.get_session(&session.id)
+                    .expect("read session")
+                    .expect("session exists")
+                    .message_count,
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn incomplete_unc_like_path_uses_platform_absolute_path_rules() {
+        let db = Database::open_in_memory().expect("in-memory db");
+        let session = db.create_session(Some("UNC fallback")).expect("session");
+        let attachments = attachment_json("///tmp/file", "file");
+
+        #[cfg(windows)]
+        {
+            assert!(db
+                .append_message_with_attachments(
+                    &session.id,
+                    "user",
+                    "///tmp/file",
+                    Some(&attachments),
+                )
+                .is_err());
+            assert!(db
+                .get_messages(&session.id, 10, 0)
+                .expect("read messages")
+                .is_empty());
+            assert_eq!(
+                db.get_session(&session.id)
+                    .expect("read session")
+                    .expect("session exists")
+                    .message_count,
+                0
+            );
+        }
+
+        #[cfg(not(windows))]
+        {
+            db.append_message_with_attachments(
+                &session.id,
+                "user",
+                "///tmp/file",
+                Some(&attachments),
+            )
+            .expect("non-Windows absolute path fallback");
+            assert_eq!(
+                db.get_session(&session.id)
+                    .expect("read session")
+                    .expect("session exists")
+                    .message_count,
+                1
             );
         }
     }
