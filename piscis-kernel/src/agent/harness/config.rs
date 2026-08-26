@@ -502,6 +502,7 @@ impl HarnessConfig {
             model: self.model,
             max_tokens: self.max_tokens,
             context_window: self.context_window,
+            budget: self.budget,
             fallback_models: self.fallback_models,
             db: self.persistence,
             plan_state: self.plan_state,
@@ -762,7 +763,7 @@ fn pct_of(value: u32, total: u32) -> u8 {
     if total == 0 {
         0
     } else {
-        ((value as u64 * 100 / total as u64).min(100)) as u8
+        (((value as u64 * 100 + total as u64 / 2) / total as u64).min(100)) as u8
     }
 }
 
@@ -806,6 +807,63 @@ mod tests {
         // Tier ordering preserved.
         assert!(cfg.budget.trigger_micro < cfg.budget.trigger_auto);
         assert!(cfg.budget.trigger_auto < cfg.budget.trigger_full);
+    }
+
+    #[test]
+    fn builder_refreshes_exact_default_thresholds_for_context_and_max_output_changes() {
+        let build = |context_window, max_tokens| {
+            let (reg, policy) = scaffolding();
+            HarnessConfig::builder("main", "test-model", reg, policy)
+                .with_context_window(context_window)
+                .with_max_tokens(max_tokens)
+                .build()
+                .budget
+        };
+        let budget_32k = build(32_000, 4_096);
+        let budget_128k = build(128_000, 4_096);
+        let budget_128k_larger_output = build(128_000, 16_384);
+
+        for budget in [budget_32k, budget_128k, budget_128k_larger_output] {
+            assert_eq!(budget.trigger_micro, budget.total * 60 / 100);
+            assert_eq!(budget.trigger_auto, budget.total * 80 / 100);
+            assert_eq!(budget.trigger_full, budget.total * 95 / 100);
+        }
+        assert!(budget_128k.trigger_micro > budget_32k.trigger_micro);
+        assert!(budget_128k_larger_output.trigger_micro < budget_128k.trigger_micro);
+        assert!(budget_128k_larger_output.trigger_auto < budget_128k.trigger_auto);
+        assert!(budget_128k_larger_output.trigger_full < budget_128k.trigger_full);
+    }
+
+    #[test]
+    fn builder_refresh_preserves_custom_tiers_and_tool_cap() {
+        let (reg, policy) = scaffolding();
+        let config = HarnessConfig::builder("main", "test-model", reg, policy)
+            .with_context_window(32_000)
+            .with_tier_percents(55, 75, 92)
+            .with_max_tool_result_tokens(6_000)
+            .with_context_window(128_000)
+            .with_max_tokens(16_384)
+            .build();
+        let budget = config.budget;
+
+        assert_eq!(budget.trigger_micro, budget.total * 55 / 100);
+        assert_eq!(budget.trigger_auto, budget.total * 75 / 100);
+        assert_eq!(budget.trigger_full, budget.total * 92 / 100);
+        assert_eq!(budget.max_tool_result_tokens, 6_000);
+
+        let agent = config.into_agent_loop(
+            crate::llm::build_client("openai", "test-key", None),
+            None,
+            None,
+        );
+        assert_eq!(agent.budget.total, budget.total);
+        assert_eq!(agent.budget.trigger_micro, budget.trigger_micro);
+        assert_eq!(agent.budget.trigger_auto, budget.trigger_auto);
+        assert_eq!(agent.budget.trigger_full, budget.trigger_full);
+        assert_eq!(
+            agent.budget.max_tool_result_tokens,
+            budget.max_tool_result_tokens
+        );
     }
 
     #[test]

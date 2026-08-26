@@ -141,10 +141,16 @@ mod tests {
     #[test]
     fn budget_classifies_tiers_monotonically() {
         let b = LayeredBudget::with_total(100_000);
+        assert_eq!(
+            (b.trigger_micro, b.trigger_auto, b.trigger_full),
+            (60_000, 80_000, 95_000)
+        );
         assert_eq!(b.classify(0), CompactionTier::None);
         assert_eq!(b.classify(b.trigger_micro - 1), CompactionTier::None);
         assert_eq!(b.classify(b.trigger_micro), CompactionTier::Micro);
+        assert_eq!(b.classify(79_999), CompactionTier::Micro);
         assert_eq!(b.classify(b.trigger_auto), CompactionTier::Auto);
+        assert_eq!(b.classify(94_999), CompactionTier::Auto);
         assert_eq!(b.classify(b.trigger_full), CompactionTier::Full);
         assert_eq!(b.classify(b.total + 10), CompactionTier::Full);
     }
