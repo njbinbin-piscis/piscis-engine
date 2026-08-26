@@ -7,6 +7,16 @@ use uuid::Uuid;
 
 const MAX_ATTACHMENTS_JSON_BYTES: usize = 64 * 1024;
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredAttachmentMetadata {
+    media_type: String,
+    filename: String,
+    uri: String,
+    size: u64,
+    sha256: String,
+}
+
 fn validate_attachments_json(attachments_json: &str) -> Result<()> {
     if attachments_json.is_empty() {
         anyhow::bail!("attachments_json must not be empty");
@@ -15,57 +25,27 @@ fn validate_attachments_json(attachments_json: &str) -> Result<()> {
         anyhow::bail!("attachments_json exceeds the 64 KiB limit");
     }
 
-    let value: serde_json::Value =
-        serde_json::from_str(attachments_json).context("attachments_json must be valid JSON")?;
-    let attachments = value
-        .as_array()
-        .ok_or_else(|| anyhow::anyhow!("attachments_json must be a JSON array"))?;
-    const ALLOWED_FIELDS: [&str; 5] = ["media_type", "filename", "uri", "size", "sha256"];
+    let attachments: Vec<StoredAttachmentMetadata> = serde_json::from_str(attachments_json)
+        .context("attachments_json must be an array of strict attachment objects")?;
+    if attachments.is_empty() {
+        anyhow::bail!("attachments_json must contain at least one attachment");
+    }
 
     for (index, attachment) in attachments.iter().enumerate() {
-        let object = attachment
-            .as_object()
-            .ok_or_else(|| anyhow::anyhow!("attachment {index} must be a JSON object"))?;
-        if object.len() != ALLOWED_FIELDS.len()
-            || !object
-                .keys()
-                .all(|key| ALLOWED_FIELDS.contains(&key.as_str()))
+        let _required_typed_fields = (
+            attachment.media_type.as_str(),
+            attachment.filename.as_str(),
+            attachment.size,
+        );
+        if attachment.sha256.len() != 64
+            || !attachment
+                .sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
         {
-            anyhow::bail!(
-                "attachment {index} must contain only media_type, filename, uri, size, and sha256"
-            );
-        }
-
-        for field in ["media_type", "filename"] {
-            if object
-                .get(field)
-                .and_then(serde_json::Value::as_str)
-                .is_none()
-            {
-                anyhow::bail!("attachment {index} field {field} must be a string");
-            }
-        }
-        if object
-            .get("size")
-            .and_then(serde_json::Value::as_u64)
-            .is_none()
-        {
-            anyhow::bail!("attachment {index} field size must be a non-negative integer");
-        }
-
-        let sha256 = object
-            .get("sha256")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| anyhow::anyhow!("attachment {index} field sha256 must be a string"))?;
-        if sha256.len() != 64 || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             anyhow::bail!("attachment {index} field sha256 must be 64 hexadecimal characters");
         }
-
-        let uri = object
-            .get("uri")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| anyhow::anyhow!("attachment {index} field uri must be a string"))?;
-        if !is_stable_local_attachment_uri(uri) {
+        if !is_stable_local_attachment_uri(&attachment.uri) {
             anyhow::bail!(
                 "attachment {index} uri must be a stable absolute local path or file URI"
             );
@@ -76,7 +56,8 @@ fn validate_attachments_json(attachments_json: &str) -> Result<()> {
 }
 
 fn is_stable_local_attachment_uri(uri: &str) -> bool {
-    if uri.is_empty() || contains_sensitive_uri_parameter(uri) {
+    if uri.is_empty() || uri.chars().any(char::is_control) || contains_sensitive_uri_parameter(uri)
+    {
         return false;
     }
 
@@ -84,48 +65,191 @@ fn is_stable_local_attachment_uri(uri: &str) -> bool {
     if lowercase.starts_with("file:") {
         return is_valid_file_uri(uri);
     }
-    if is_native_absolute_path(uri) {
-        return true;
+    if looks_like_windows_drive_path(uri) {
+        return is_valid_windows_drive_path(uri);
+    }
+    if looks_like_windows_unc_path(uri) {
+        return is_valid_windows_unc_path(uri);
     }
 
-    false
+    !has_uri_scheme(uri) && Path::new(uri).is_absolute()
 }
 
 fn is_valid_file_uri(uri: &str) -> bool {
-    if uri.contains(['?', '#']) {
+    if uri.chars().any(char::is_control)
+        || uri.contains(['?', '#', '\\'])
+        || !uri["file:".len()..].starts_with("//")
+    {
         return false;
     }
 
-    let path = &uri["file:".len()..];
-    if let Some(unc) = path.strip_prefix("//") {
-        let authority_end = unc.find(['/', '\\']).unwrap_or(unc.len());
-        if unc[..authority_end].contains('@') {
+    let hierarchy = &uri[("file:".len() + 2)..];
+    if hierarchy.starts_with('/') {
+        let Some(path) = percent_decode_file_uri_path(hierarchy) else {
             return false;
-        }
-        return unc
-            .split(['/', '\\'])
-            .filter(|component| !component.is_empty())
-            .count()
-            >= 2;
+        };
+        return is_valid_local_file_uri_path(&path);
     }
 
-    is_native_absolute_path(path)
+    let Some(path_start) = hierarchy.find('/') else {
+        return false;
+    };
+    let authority = &hierarchy[..path_start];
+    let Some(path) = percent_decode_file_uri_path(&hierarchy[path_start..]) else {
+        return false;
+    };
+    is_valid_file_uri_host(authority) && is_valid_file_uri_unc_path(&path)
 }
 
-fn is_native_absolute_path(path: &str) -> bool {
+fn percent_decode_file_uri_path(path: &str) -> Option<String> {
     let bytes = path.as_bytes();
-    let windows_drive_absolute = bytes.len() >= 3
-        && bytes[0].is_ascii_alphabetic()
-        && bytes[1] == b':'
-        && matches!(bytes[2], b'/' | b'\\');
-    let windows_unc_absolute = path.starts_with(r"\\")
-        && path[2..]
-            .split(['/', '\\'])
-            .filter(|component| !component.is_empty())
-            .count()
-            >= 2;
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let percent_encoded = bytes[index] == b'%';
+        let byte = if percent_encoded {
+            if index + 2 >= bytes.len() {
+                return None;
+            }
+            let high = hex_value(bytes[index + 1])?;
+            let low = hex_value(bytes[index + 2])?;
+            index += 3;
+            (high << 4) | low
+        } else {
+            let byte = bytes[index];
+            index += 1;
+            byte
+        };
+        if byte < b' ' || byte == 0x7f || byte == b'\\' {
+            return None;
+        }
+        if percent_encoded && byte == b'/' {
+            return None;
+        }
+        decoded.push(byte);
+    }
 
-    windows_drive_absolute || windows_unc_absolute || Path::new(path).is_absolute()
+    let decoded = String::from_utf8(decoded).ok()?;
+    if decoded.chars().any(char::is_control) || contains_sensitive_uri_parameter(&decoded) {
+        return None;
+    }
+    Some(decoded)
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn is_valid_local_file_uri_path(path: &str) -> bool {
+    if !path.starts_with('/') || path.len() <= 1 || path.starts_with("//") {
+        return false;
+    }
+
+    let local_path = &path[1..];
+    if looks_like_windows_drive_path(local_path) {
+        return is_valid_windows_drive_path(local_path);
+    }
+    valid_explicit_uri_components(local_path, false)
+}
+
+fn is_valid_file_uri_host(host: &str) -> bool {
+    !host.is_empty()
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+}
+
+fn is_valid_file_uri_unc_path(path: &str) -> bool {
+    let Some(components) = path.strip_prefix('/') else {
+        return false;
+    };
+    valid_explicit_uri_components(components, true)
+}
+
+fn valid_explicit_uri_components(path: &str, windows_rules: bool) -> bool {
+    let components: Vec<&str> = path.split('/').collect();
+    !components.is_empty()
+        && components.iter().all(|component| {
+            !component.is_empty()
+                && *component != "."
+                && *component != ".."
+                && (!windows_rules || is_valid_windows_component(component))
+        })
+}
+
+fn looks_like_windows_drive_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+}
+
+fn is_valid_windows_drive_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    looks_like_windows_drive_path(path)
+        && bytes.len() >= 3
+        && matches!(bytes[2], b'/' | b'\\')
+        && valid_windows_path_components(&path[3..], 0)
+}
+
+fn looks_like_windows_unc_path(path: &str) -> bool {
+    path.starts_with(r"\\") || path.starts_with("//")
+}
+
+fn is_valid_windows_unc_path(path: &str) -> bool {
+    if !looks_like_windows_unc_path(path) {
+        return false;
+    }
+    let remainder = &path[2..];
+    if remainder.starts_with(['?', '.']) {
+        return false;
+    }
+    valid_windows_path_components(remainder, 2)
+}
+
+fn valid_windows_path_components(path: &str, minimum_components: usize) -> bool {
+    if path.is_empty() {
+        return minimum_components == 0;
+    }
+    let components: Vec<&str> = path.split(['/', '\\']).collect();
+    components.len() >= minimum_components
+        && components
+            .iter()
+            .all(|component| is_valid_windows_component(component))
+}
+
+fn is_valid_windows_component(component: &str) -> bool {
+    !component.is_empty()
+        && component != "."
+        && component != ".."
+        && !component.ends_with([' ', '.'])
+        && !component.chars().any(|character| {
+            character.is_control()
+                || matches!(
+                    character,
+                    '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'
+                )
+        })
+}
+
+fn has_uri_scheme(value: &str) -> bool {
+    let Some(colon) = value.find(':') else {
+        return false;
+    };
+    let scheme = &value[..colon];
+    !scheme.is_empty()
+        && scheme.bytes().enumerate().all(|(index, byte)| {
+            byte.is_ascii_alphabetic()
+                || (index > 0 && (byte.is_ascii_digit() || matches!(byte, b'+' | b'-' | b'.')))
+        })
 }
 
 fn contains_sensitive_uri_parameter(uri: &str) -> bool {
@@ -145,6 +269,10 @@ fn contains_sensitive_uri_parameter(uri: &str) -> bool {
         "secret%3d",
         "password=",
         "password%3d",
+        "auth=",
+        "auth%3d",
+        "sig=",
+        "sig%3d",
     ]
     .iter()
     .any(|parameter| lowercase.contains(parameter))
@@ -5159,6 +5287,18 @@ mod tests {
         .to_string()
     }
 
+    fn attachment_json_with_exact_len(total_len: usize) -> String {
+        let prefix = r#"[{"media_type":"application/octet-stream","filename":""#;
+        let suffix =
+            format!(r#"","uri":"C:/files/report.bin","size":0,"sha256":"{ATTACHMENT_SHA256}"}}]"#);
+        let filename_len = total_len
+            .checked_sub(prefix.len() + suffix.len())
+            .expect("requested JSON length is large enough");
+        let json = format!("{prefix}{}{suffix}", "a".repeat(filename_len));
+        assert_eq!(json.len(), total_len);
+        json
+    }
+
     #[test]
     fn get_messages_older_returns_previous_page_in_insert_order() {
         let db = Database::open_in_memory().expect("in-memory db");
@@ -5457,6 +5597,7 @@ mod tests {
 
         let invalid_cases = [
             ("empty string", String::new()),
+            ("empty array", "[]".to_string()),
             ("malformed JSON", "[".to_string()),
             ("non-array root", valid.to_string()),
             ("non-object item", serde_json::json!(["bad"]).to_string()),
@@ -5535,6 +5676,185 @@ mod tests {
                 "{label} must not increment message_count"
             );
         }
+    }
+
+    #[test]
+    fn strict_attachment_json_rejects_duplicate_fields_and_u64_overflow_without_writes() {
+        let db = Database::open_in_memory().expect("in-memory db");
+        let session = db
+            .create_session(Some("Strict attachment JSON"))
+            .expect("session");
+        let duplicate_uri = format!(
+            r#"[{{"media_type":"application/pdf","filename":"report.pdf","uri":"C:/files/first.pdf","uri":"C:/files/second.pdf","size":1,"sha256":"{ATTACHMENT_SHA256}"}}]"#
+        );
+        let duplicate_size = format!(
+            r#"[{{"media_type":"application/pdf","filename":"report.pdf","uri":"C:/files/report.pdf","size":1,"size":2,"sha256":"{ATTACHMENT_SHA256}"}}]"#
+        );
+        let duplicate_sha256 = format!(
+            r#"[{{"media_type":"application/pdf","filename":"report.pdf","uri":"C:/files/report.pdf","size":1,"sha256":"{ATTACHMENT_SHA256}","sha256":"{ATTACHMENT_SHA256}"}}]"#
+        );
+        let overflowing_size = format!(
+            r#"[{{"media_type":"application/pdf","filename":"report.pdf","uri":"C:/files/report.pdf","size":18446744073709551616,"sha256":"{ATTACHMENT_SHA256}"}}]"#
+        );
+
+        for (label, attachments) in [
+            ("duplicate uri", duplicate_uri),
+            ("duplicate size", duplicate_size),
+            ("duplicate sha256", duplicate_sha256),
+            ("size exceeds u64", overflowing_size),
+        ] {
+            assert!(
+                db.append_message_with_attachments(&session.id, "user", label, Some(&attachments))
+                    .is_err(),
+                "{label} should be rejected"
+            );
+            assert!(
+                db.get_messages(&session.id, 10, 0)
+                    .expect("read messages")
+                    .is_empty(),
+                "{label} must not insert"
+            );
+            assert_eq!(
+                db.get_session(&session.id)
+                    .expect("read session")
+                    .expect("session exists")
+                    .message_count,
+                0,
+                "{label} must not update message_count"
+            );
+        }
+    }
+
+    #[test]
+    fn attachment_uri_grammar_accepts_shallow_file_uri_and_explicit_local_forms() {
+        let db = Database::open_in_memory().expect("in-memory db");
+        let session = db.create_session(Some("URI grammar")).expect("session");
+        let platform_absolute = std::env::current_dir()
+            .expect("current dir")
+            .join("platform-local.bin")
+            .to_string_lossy()
+            .into_owned();
+
+        for uri in [
+            "file:///a".to_string(),
+            "FiLe:///C:/files/local.bin".to_string(),
+            "file:///a%20b".to_string(),
+            "file://host/share/path".to_string(),
+            r"C:\files\local.bin".to_string(),
+            r"\\host\share\local.bin".to_string(),
+            platform_absolute,
+        ] {
+            let attachments = attachment_json(&uri, "local.bin");
+            db.append_message_with_attachments(&session.id, "user", &uri, Some(&attachments))
+                .unwrap_or_else(|error| panic!("{uri} should be accepted: {error:#}"));
+        }
+        assert_eq!(
+            db.get_session(&session.id)
+                .expect("read session")
+                .expect("session exists")
+                .message_count,
+            7
+        );
+    }
+
+    #[test]
+    fn attachment_uri_grammar_rejects_ambiguous_or_unsafe_forms_without_writes() {
+        let db = Database::open_in_memory().expect("in-memory db");
+        let session = db.create_session(Some("Unsafe URIs")).expect("session");
+        let platform_sensitive_path = std::env::current_dir()
+            .expect("current dir")
+            .join("report.pdf?auth_token=secret")
+            .to_string_lossy()
+            .into_owned();
+
+        for uri in [
+            "file://host:445/share/path",
+            "file://user@host/share/path",
+            r"file://host\share\path",
+            "file://bad_host/share/path",
+            "file://host",
+            "file://host/",
+            "file:/a",
+            "file:///a?token=secret",
+            "file:///a#fragment",
+            "file:///a%2",
+            "file:///a%00",
+            "file:///a%5Cescape",
+            "file:///a\u{0001}",
+            r"\\?\C:\files\device.bin",
+            r"\\.\C:\files\device.bin",
+            r"C:\files\bad?.pdf",
+            r"C:\files\bad<.pdf",
+            r"C:\files\bad|.pdf",
+            "C:/files/bad\u{0001}.pdf",
+            r"\\host",
+            r"\\host\share\bad*.pdf",
+            platform_sensitive_path.as_str(),
+        ] {
+            let attachments = attachment_json(uri, "unsafe.bin");
+            assert!(
+                db.append_message_with_attachments(&session.id, "user", uri, Some(&attachments))
+                    .is_err(),
+                "{uri:?} should be rejected"
+            );
+            assert!(
+                db.get_messages(&session.id, 10, 0)
+                    .expect("read messages")
+                    .is_empty(),
+                "{uri:?} must not insert"
+            );
+            assert_eq!(
+                db.get_session(&session.id)
+                    .expect("read session")
+                    .expect("session exists")
+                    .message_count,
+                0,
+                "{uri:?} must not update message_count"
+            );
+        }
+    }
+
+    #[test]
+    fn attachment_json_utf8_byte_limit_is_exact_and_rejection_has_no_write() {
+        let db = Database::open_in_memory().expect("in-memory db");
+        let accepted_session = db.create_session(Some("64 KiB")).expect("session");
+        let accepted = attachment_json_with_exact_len(65_536);
+        db.append_message_with_attachments(
+            &accepted_session.id,
+            "user",
+            "exact limit",
+            Some(&accepted),
+        )
+        .expect("exactly 65536 bytes should be accepted");
+        assert_eq!(
+            db.get_session(&accepted_session.id)
+                .expect("read session")
+                .expect("session exists")
+                .message_count,
+            1
+        );
+
+        let rejected_session = db.create_session(Some("Over 64 KiB")).expect("session");
+        let rejected = attachment_json_with_exact_len(65_537);
+        assert!(db
+            .append_message_with_attachments(
+                &rejected_session.id,
+                "user",
+                "over limit",
+                Some(&rejected),
+            )
+            .is_err());
+        assert!(db
+            .get_messages(&rejected_session.id, 10, 0)
+            .expect("read messages")
+            .is_empty());
+        assert_eq!(
+            db.get_session(&rejected_session.id)
+                .expect("read session")
+                .expect("session exists")
+                .message_count,
+            0
+        );
     }
 
     #[test]
