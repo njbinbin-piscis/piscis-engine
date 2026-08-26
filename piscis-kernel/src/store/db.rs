@@ -107,10 +107,16 @@ fn is_valid_file_uri(uri: &str) -> bool {
     let Some(path) = percent_decode_file_uri_path(&hierarchy[path_start..]) else {
         return false;
     };
-    if !is_valid_file_uri_host(authority) {
+    let Some(normalized_authority) = normalize_file_uri_host(authority) else {
+        return false;
+    };
+    if matches!(normalized_authority.as_slice(), b"." | b"..") {
         return false;
     }
-    if authority.eq_ignore_ascii_case("localhost") {
+    if normalized_authority
+        .as_slice()
+        .eq_ignore_ascii_case(b"localhost")
+    {
         return is_valid_local_file_uri_path(&path);
     }
     is_valid_file_uri_unc_path(&path)
@@ -172,48 +178,47 @@ fn is_valid_local_file_uri_path(path: &str) -> bool {
     valid_explicit_uri_components(local_path, false)
 }
 
-fn is_valid_file_uri_host(host: &str) -> bool {
+fn normalize_file_uri_host(host: &str) -> Option<Vec<u8>> {
     if let Some(ipv6) = host
         .strip_prefix('[')
         .and_then(|value| value.strip_suffix(']'))
     {
-        return ipv6.parse::<std::net::Ipv6Addr>().is_ok();
+        let address = ipv6.parse::<std::net::Ipv6Addr>().ok()?;
+        return Some(format!("[{address}]").into_bytes());
     }
     if host.contains(['[', ']', ':']) || host.is_empty() {
-        return false;
+        return None;
     }
-    if host.parse::<std::net::Ipv4Addr>().is_ok() {
-        return true;
+    if let Ok(address) = host.parse::<std::net::Ipv4Addr>() {
+        return Some(address.to_string().into_bytes());
     }
-    is_valid_file_uri_reg_name(host)
+    normalize_file_uri_reg_name(host)
 }
 
-fn is_valid_file_uri_reg_name(host: &str) -> bool {
+fn normalize_file_uri_reg_name(host: &str) -> Option<Vec<u8>> {
     let bytes = host.as_bytes();
     if bytes.is_empty() {
-        return false;
+        return None;
     }
 
+    let mut normalized = Vec::with_capacity(bytes.len());
     let mut index = 0;
     while index < bytes.len() {
         let byte = bytes[index];
         if byte == b'%' {
             if index + 2 >= bytes.len() {
-                return false;
+                return None;
             }
-            let Some(high) = hex_value(bytes[index + 1]) else {
-                return false;
-            };
-            let Some(low) = hex_value(bytes[index + 2]) else {
-                return false;
-            };
+            let high = hex_value(bytes[index + 1])?;
+            let low = hex_value(bytes[index + 2])?;
             let decoded = (high << 4) | low;
             if decoded < b' '
                 || decoded == 0x7f
                 || matches!(decoded, b'@' | b':' | b'/' | b'\\' | b'?' | b'#')
             {
-                return false;
+                return None;
             }
+            normalized.push(decoded.to_ascii_lowercase());
             index += 3;
             continue;
         }
@@ -224,12 +229,13 @@ fn is_valid_file_uri_reg_name(host: &str) -> bool {
             b'!' | b'$' | b'&' | b'\'' | b'(' | b')' | b'*' | b'+' | b',' | b';' | b'='
         );
         if !unreserved && !sub_delim {
-            return false;
+            return None;
         }
+        normalized.push(byte.to_ascii_lowercase());
         index += 1;
     }
 
-    true
+    Some(normalized)
 }
 
 fn is_valid_file_uri_unc_path(path: &str) -> bool {
@@ -5837,9 +5843,11 @@ mod tests {
             "file://host/share/path".to_string(),
             "file://127.0.0.1/share/path".to_string(),
             "file://999.999.999.999/share/path".to_string(),
+            "file://files.example.test/share/path".to_string(),
             "file://[::1]/share/path".to_string(),
             "file://name_with~sub!$&'()*+,;=/share/path".to_string(),
             "file://pct%2Dhost/share/path".to_string(),
+            "file://%6Cocalhost/C:/a".to_string(),
             r"C:\files\local.bin".to_string(),
             r"\\host\share\local.bin".to_string(),
             platform_absolute,
@@ -5853,7 +5861,7 @@ mod tests {
                 .expect("read session")
                 .expect("session exists")
                 .message_count,
-            15
+            17
         );
     }
 
@@ -5950,6 +5958,41 @@ mod tests {
                 db.append_message_with_attachments(&session.id, "user", uri, Some(&attachments))
                     .is_err(),
                 "{uri:?} should reject a DOS device basename"
+            );
+            assert!(db
+                .get_messages(&session.id, 10, 0)
+                .expect("read messages")
+                .is_empty());
+            assert_eq!(
+                db.get_session(&session.id)
+                    .expect("read session")
+                    .expect("session exists")
+                    .message_count,
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn attachment_uri_rejects_raw_and_encoded_device_namespace_authorities_without_writes() {
+        let db = Database::open_in_memory().expect("in-memory db");
+        let session = db
+            .create_session(Some("Device namespace authorities"))
+            .expect("session");
+
+        for uri in [
+            "file://./pipe/name",
+            "file://./PhysicalDrive0",
+            "file://../share/name",
+            "file://%2E/pipe/name",
+            "file://%2e/PhysicalDrive0",
+            "file://%2E%2E/share/name",
+        ] {
+            let attachments = attachment_json(uri, "device.bin");
+            assert!(
+                db.append_message_with_attachments(&session.id, "user", uri, Some(&attachments))
+                    .is_err(),
+                "{uri:?} should reject a device namespace authority"
             );
             assert!(db
                 .get_messages(&session.id, 10, 0)
