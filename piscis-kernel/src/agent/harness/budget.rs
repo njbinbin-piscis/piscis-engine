@@ -58,9 +58,6 @@ pub struct LayeredBudget {
     pub trigger_auto: u32,
     pub trigger_full: u32,
     pub max_tool_result_tokens: u32,
-    micro_percent: u8,
-    auto_percent: u8,
-    full_percent: u8,
 }
 
 impl LayeredBudget {
@@ -78,28 +75,16 @@ impl LayeredBudget {
             trigger_auto: percent_of(total, DEFAULT_TIER_AUTO_PERCENT),
             trigger_full: percent_of(total, DEFAULT_TIER_FULL_PERCENT),
             max_tool_result_tokens: DEFAULT_MAX_TOOL_RESULT_TOKENS,
-            micro_percent: DEFAULT_TIER_MICRO_PERCENT,
-            auto_percent: DEFAULT_TIER_AUTO_PERCENT,
-            full_percent: DEFAULT_TIER_FULL_PERCENT,
         }
     }
 
     /// Override the three tier percentages. Panics in debug / clamps in
     /// release if the ordering `micro < auto < full <= 100` is violated.
     pub fn with_tier_percents(mut self, micro: u8, auto: u8, full: u8) -> Self {
-        debug_assert!(
-            micro < auto && auto < full && full <= 100,
-            "tier percents must satisfy micro < auto < full <= 100 (got {micro}/{auto}/{full})"
-        );
-        let micro = micro.min(99);
-        let auto = auto.clamp(micro + 1, 99);
-        let full = full.clamp(auto + 1, 100);
+        let (micro, auto, full) = normalize_tier_percents(micro, auto, full);
         self.trigger_micro = percent_of(self.total, micro);
         self.trigger_auto = percent_of(self.total, auto);
         self.trigger_full = percent_of(self.total, full);
-        self.micro_percent = micro;
-        self.auto_percent = auto;
-        self.full_percent = full;
         self
     }
 
@@ -107,11 +92,6 @@ impl LayeredBudget {
     pub fn with_max_tool_result_tokens(mut self, v: u32) -> Self {
         self.max_tool_result_tokens = if v == 0 { 0 } else { v.clamp(1_000, 64_000) };
         self
-    }
-
-    /// Return the lossless tier percentages used to derive the thresholds.
-    pub(crate) fn tier_percents(&self) -> (u8, u8, u8) {
-        (self.micro_percent, self.auto_percent, self.full_percent)
     }
 
     /// Classify an estimated request size into a tier.
@@ -132,6 +112,17 @@ impl Default for LayeredBudget {
     fn default() -> Self {
         Self::from_context_window(0, 4_096)
     }
+}
+
+pub(crate) fn normalize_tier_percents(micro: u8, auto: u8, full: u8) -> (u8, u8, u8) {
+    debug_assert!(
+        micro < auto && auto < full && full <= 100,
+        "tier percents must satisfy micro < auto < full <= 100 (got {micro}/{auto}/{full})"
+    );
+    let micro = micro.min(99);
+    let auto = auto.clamp(micro + 1, 99);
+    let full = full.clamp(auto + 1, 100);
+    (micro, auto, full)
 }
 
 fn percent_of(total: u32, pct: u8) -> u32 {
@@ -198,5 +189,18 @@ mod tests {
         assert_eq!(b.max_tool_result_tokens, 1_000);
         let b = LayeredBudget::with_total(100_000).with_max_tool_result_tokens(200_000);
         assert_eq!(b.max_tool_result_tokens, 64_000);
+    }
+
+    #[test]
+    fn public_layered_budget_keeps_struct_literal_compatibility() {
+        let budget = LayeredBudget {
+            total: 100_000,
+            trigger_micro: 60_000,
+            trigger_auto: 80_000,
+            trigger_full: 95_000,
+            max_tool_result_tokens: 8_000,
+        };
+
+        assert_eq!(budget.classify(79_999), CompactionTier::Micro);
     }
 }

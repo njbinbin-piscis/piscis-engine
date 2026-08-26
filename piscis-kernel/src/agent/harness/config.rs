@@ -529,6 +529,7 @@ impl HarnessConfig {
 /// Builder. All `with_*` methods consume and return `self` for chaining.
 pub struct HarnessConfigBuilder {
     inner: HarnessConfig,
+    tier_percents: (u8, u8, u8),
 }
 
 impl HarnessConfigBuilder {
@@ -569,7 +570,14 @@ impl HarnessConfigBuilder {
             memory_retrieval_prompt: None,
             loop_strategy: None,
         };
-        Self { inner }
+        Self {
+            inner,
+            tier_percents: (
+                super::budget::DEFAULT_TIER_MICRO_PERCENT,
+                super::budget::DEFAULT_TIER_AUTO_PERCENT,
+                super::budget::DEFAULT_TIER_FULL_PERCENT,
+            ),
+        }
     }
 
     /// Wire host lifecycle hooks into the loop.
@@ -684,7 +692,12 @@ impl HarnessConfigBuilder {
     }
 
     pub fn with_tier_percents(mut self, micro: u8, auto: u8, full: u8) -> Self {
-        self.inner.budget = self.inner.budget.with_tier_percents(micro, auto, full);
+        self.tier_percents = super::budget::normalize_tier_percents(micro, auto, full);
+        self.inner.budget = self.inner.budget.with_tier_percents(
+            self.tier_percents.0,
+            self.tier_percents.1,
+            self.tier_percents.2,
+        );
         self
     }
 
@@ -698,10 +711,16 @@ impl HarnessConfigBuilder {
     /// single call. Used by scene factories to keep their signatures
     /// narrow.
     pub fn with_compaction_settings(mut self, c: &CompactionSettings) -> Self {
+        self.tier_percents =
+            super::budget::normalize_tier_percents(c.micro_percent, c.auto_percent, c.full_percent);
         self.inner.budget = self
             .inner
             .budget
-            .with_tier_percents(c.micro_percent, c.auto_percent, c.full_percent)
+            .with_tier_percents(
+                self.tier_percents.0,
+                self.tier_percents.1,
+                self.tier_percents.2,
+            )
             .with_max_tool_result_tokens(c.max_tool_result_tokens);
         self.inner.summary_model = c.summary_model.clone().filter(|s| !s.trim().is_empty());
         self
@@ -742,10 +761,13 @@ impl HarnessConfigBuilder {
         // Re-derive caps from the current (context_window, max_tokens)
         // while preserving any previously-set tier percents / tool cap.
         let prev = self.inner.budget;
-        let (micro_percent, auto_percent, full_percent) = prev.tier_percents();
         self.inner.budget =
             LayeredBudget::from_context_window(self.inner.context_window, self.inner.max_tokens)
-                .with_tier_percents(micro_percent, auto_percent, full_percent)
+                .with_tier_percents(
+                    self.tier_percents.0,
+                    self.tier_percents.1,
+                    self.tier_percents.2,
+                )
                 .with_max_tool_result_tokens(prev.max_tool_result_tokens);
     }
 }
@@ -847,6 +869,31 @@ mod tests {
             agent.budget.max_tool_result_tokens,
             budget.max_tool_result_tokens
         );
+    }
+
+    #[test]
+    fn builder_refresh_preserves_compaction_settings_percents() {
+        let (reg, policy) = scaffolding();
+        let settings = CompactionSettings {
+            micro_percent: 55,
+            auto_percent: 75,
+            full_percent: 92,
+            max_tool_result_tokens: 6_000,
+            summary_model: None,
+        };
+        let budget = HarnessConfig::builder("main", "test-model", reg, policy)
+            .with_compaction_settings(&settings)
+            .with_context_window(3)
+            .with_max_tokens(1)
+            .with_context_window(128_000)
+            .with_max_tokens(16_384)
+            .build()
+            .budget;
+
+        assert_eq!(budget.trigger_micro, budget.total * 55 / 100);
+        assert_eq!(budget.trigger_auto, budget.total * 75 / 100);
+        assert_eq!(budget.trigger_full, budget.total * 92 / 100);
+        assert_eq!(budget.max_tool_result_tokens, 6_000);
     }
 
     #[test]

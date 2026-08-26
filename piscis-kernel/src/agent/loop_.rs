@@ -706,21 +706,15 @@ pub use super::compaction::{
     CTX_COMPACT_AFTER, CTX_FULL_TURNS, CTX_KEEP_RECENT_TOOL_CARRIERS, CTX_PRESERVE_RECENT_TURNS,
     CTX_TRIM_HEAD, CTX_TRIM_TAIL,
 };
-/// Minimum chars a tool result must exceed before it is eligible for trimming.
-/// Prevents trimming results that are already small enough to be useful in full.
-const CTX_TRIM_MIN_SIZE: usize = CTX_TRIM_HEAD + CTX_TRIM_TAIL + 100;
 const SUMMARY_KEEP_RECENT_RATIO: f64 = 0.60; // keep newest 60% of budget intact
 
 /// Level-1 compaction: trim oversized individual tool results (head + tail).
 ///
-/// A result is trimmed when it exceeds BOTH `single_limit` (the per-result share
-/// of the context budget) AND `CTX_TRIM_MIN_SIZE` (the absolute minimum worth
-/// trimming). Using `min` ensures we never trim a result that is already within
-/// the budget share, and never trim one that is too small to benefit from it.
-pub fn compact_trim_tool_results(messages: &mut [LlmMessage], single_limit: usize) -> bool {
-    // Effective threshold: trim only if the result exceeds the budget share AND
-    // is large enough that trimming makes sense (> head + tail + 100 chars).
-    let trim_threshold = single_limit.max(CTX_TRIM_MIN_SIZE);
+/// `single_limit_tokens` is a hard token ceiling measured by the shared
+/// [`crate::llm::estimate_tokens`] estimator. The retained head, marker, and
+/// tail together never exceed that ceiling. The caller handles the configured
+/// zero value as "disabled" by skipping this helper.
+pub fn compact_trim_tool_results(messages: &mut [LlmMessage], single_limit_tokens: usize) -> bool {
     let mut changed = false;
     for msg in messages.iter_mut() {
         if msg.role != "user" {
@@ -729,16 +723,8 @@ pub fn compact_trim_tool_results(messages: &mut [LlmMessage], single_limit: usiz
         if let MessageContent::Blocks(ref mut blocks) = msg.content {
             for block in blocks.iter_mut() {
                 if let ContentBlock::ToolResult { content, .. } = block {
-                    // Collect chars once to avoid O(n) traversal three times.
-                    let chars: Vec<char> = content.chars().collect();
-                    let len = chars.len();
-                    if len > trim_threshold {
-                        let head: String = chars[..CTX_TRIM_HEAD].iter().collect();
-                        let tail_start = len.saturating_sub(CTX_TRIM_TAIL);
-                        let tail: String = chars[tail_start..].iter().collect();
-                        let removed = len - CTX_TRIM_HEAD - CTX_TRIM_TAIL;
-                        *content =
-                            format!("{}\n... [{} chars removed] ...\n{}", head, removed, tail);
+                    if crate::llm::estimate_tokens(content) > single_limit_tokens {
+                        *content = trim_tool_result_to_token_limit(content, single_limit_tokens);
                         changed = true;
                     }
                 }
@@ -746,6 +732,61 @@ pub fn compact_trim_tool_results(messages: &mut [LlmMessage], single_limit: usiz
         }
     }
     changed
+}
+
+/// Select a Unicode-safe head/tail view under a token budget. Each binary
+/// search probe builds at most one candidate and the source chars are collected
+/// once, keeping the work O(n log n) without repeated nth-char scans.
+fn trim_tool_result_to_token_limit(content: &str, token_limit: usize) -> String {
+    let chars: Vec<char> = content.chars().collect();
+    if chars.is_empty() || token_limit == 0 {
+        return String::new();
+    }
+
+    let candidate = |keep_chars: usize| {
+        let keep_chars = keep_chars.min(chars.len().saturating_sub(1));
+        let ratio_total = CTX_TRIM_HEAD + CTX_TRIM_TAIL;
+        let head_chars = if keep_chars == 0 {
+            0
+        } else {
+            keep_chars
+                .saturating_mul(CTX_TRIM_HEAD)
+                .div_ceil(ratio_total)
+        }
+        .min(keep_chars);
+        let tail_chars = keep_chars - head_chars;
+        let removed = chars.len() - keep_chars;
+        let head: String = chars[..head_chars].iter().collect();
+        let tail_start = chars.len() - tail_chars;
+        let tail: String = chars[tail_start..].iter().collect();
+        format!("{}\n... [{} chars removed] ...\n{}", head, removed, tail)
+    };
+
+    let marker_only = candidate(0);
+    if crate::llm::estimate_tokens(&marker_only) > token_limit {
+        // A very small programmatic cap may not fit even the marker. Empty
+        // content is the only representation that can honour the hard cap.
+        return String::new();
+    }
+
+    let mut low = 0usize;
+    let mut high = chars.len().saturating_sub(1);
+    let mut best = marker_only;
+    while low <= high {
+        let keep_chars = low + (high - low) / 2;
+        let probe = candidate(keep_chars);
+        if crate::llm::estimate_tokens(&probe) <= token_limit {
+            best = probe;
+            low = keep_chars.saturating_add(1);
+        } else if keep_chars == 0 {
+            break;
+        } else {
+            high = keep_chars - 1;
+        }
+    }
+
+    debug_assert!(crate::llm::estimate_tokens(&best) <= token_limit);
+    best
 }
 
 pub struct CompactionOutcome {
@@ -1378,9 +1419,8 @@ pub fn build_request_view_messages(
         recent_tool_carriers,
     );
     if max_tool_result_tokens != 0 {
-        let dynamic_limit =
-            (message_budget_tokens as f64 * CONTEXT_SINGLE_RESULT_SHARE * 4.0) as usize;
-        let configured_limit = (max_tool_result_tokens as usize).saturating_mul(4);
+        let dynamic_limit = (message_budget_tokens as f64 * CONTEXT_SINGLE_RESULT_SHARE) as usize;
+        let configured_limit = max_tool_result_tokens as usize;
         compact_trim_tool_results(&mut out, dynamic_limit.min(configured_limit));
     }
     out
@@ -5062,6 +5102,138 @@ mod tests {
         assert_eq!(reported_estimate as usize, wire_estimate);
     }
 
+    async fn capture_token_capped_wire_result(
+        full_content: &str,
+        token_cap: usize,
+        include_image: bool,
+    ) -> (String, bool) {
+        let tool_use_id = "token-cap-call";
+        let mut result_blocks = vec![ContentBlock::ToolResult {
+            tool_use_id: tool_use_id.into(),
+            content: full_content.into(),
+            is_error: false,
+        }];
+        if include_image {
+            result_blocks.push(ContentBlock::Image {
+                source: crate::llm::ImageSource {
+                    source_type: "base64".into(),
+                    media_type: "image/png".into(),
+                    data: "aGVsbG8=".into(),
+                },
+            });
+        }
+        let messages = vec![
+            make_text_msg("user", "inspect a token-capped tool result"),
+            LlmMessage {
+                role: "assistant".into(),
+                content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                    id: tool_use_id.into(),
+                    name: "shell".into(),
+                    input: json!({"command": "emit large output"}),
+                }]),
+            },
+            LlmMessage {
+                role: "user".into(),
+                content: MessageContent::Blocks(result_blocks),
+            },
+            make_text_msg("user", "CURRENT_TOKEN_CAP_REQUEST_MUST_SURVIVE"),
+        ];
+        let semantic_calls = Arc::new(AtomicUsize::new(0));
+        let main_requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut budget = crate::agent::harness::LayeredBudget::with_total(100_000);
+        // LayeredBudget is a public runtime contract; direct field values are
+        // valid even when builder convenience methods apply a UI-oriented clamp.
+        budget.max_tool_result_tokens = token_cap as u32;
+        let agent = tier_agent(
+            RequestViewSpyClient {
+                semantic_calls: semantic_calls.clone(),
+                main_requests: main_requests.clone(),
+            },
+            None,
+            budget,
+        );
+
+        let _events = run_tier_agent(agent, messages, "wire-token-cap".into()).await;
+
+        assert_eq!(semantic_calls.load(Ordering::SeqCst), 0);
+        let requests = main_requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let blocks = requests[0]
+            .messages
+            .iter()
+            .find_map(|message| match &message.content {
+                MessageContent::Blocks(blocks)
+                    if blocks.iter().any(|block| {
+                        matches!(block, ContentBlock::ToolResult { tool_use_id: id, .. } if id == tool_use_id)
+                    }) => Some(blocks),
+                _ => None,
+            })
+            .expect("tool-result carrier on the main wire request");
+        let content = blocks
+            .iter()
+            .find_map(|block| match block {
+                ContentBlock::ToolResult { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .expect("tool result content");
+        let has_image = blocks
+            .iter()
+            .any(|block| matches!(block, ContentBlock::Image { .. }));
+        (content, has_image)
+    }
+
+    #[tokio::test]
+    async fn ascii_tool_result_on_real_wire_respects_token_cap() {
+        let token_cap = 256usize;
+        let full_content = "ASCII tool output ".repeat(2_000);
+        assert!(crate::llm::estimate_tokens(&full_content) > token_cap);
+
+        let (wire_content, _) =
+            capture_token_capped_wire_result(&full_content, token_cap, false).await;
+
+        assert!(wire_content.contains("chars removed"));
+        assert!(
+            crate::llm::estimate_tokens(&wire_content) <= token_cap,
+            "ASCII wire result used {} tokens for cap {token_cap}",
+            crate::llm::estimate_tokens(&wire_content)
+        );
+    }
+
+    #[tokio::test]
+    async fn cjk_tool_result_on_real_wire_respects_token_cap() {
+        let token_cap = 256usize;
+        let full_content = "中文工具结果输出".repeat(2_000);
+        assert!(crate::llm::estimate_tokens(&full_content) > token_cap);
+
+        let (wire_content, _) =
+            capture_token_capped_wire_result(&full_content, token_cap, false).await;
+
+        assert!(wire_content.contains("chars removed"));
+        assert!(
+            crate::llm::estimate_tokens(&wire_content) <= token_cap,
+            "CJK wire result used {} tokens for cap {token_cap}",
+            crate::llm::estimate_tokens(&wire_content)
+        );
+    }
+
+    #[tokio::test]
+    async fn mixed_tool_result_image_carrier_on_real_wire_respects_token_cap() {
+        let token_cap = 256usize;
+        let full_content = "mixed ASCII 中文结果 12345 ".repeat(2_000);
+        assert!(crate::llm::estimate_tokens(&full_content) > token_cap);
+
+        let (wire_content, has_image) =
+            capture_token_capped_wire_result(&full_content, token_cap, true).await;
+
+        assert!(wire_content.contains("chars removed"));
+        assert!(
+            crate::llm::estimate_tokens(&wire_content) <= token_cap,
+            "mixed wire result used {} tokens for cap {token_cap}",
+            crate::llm::estimate_tokens(&wire_content)
+        );
+        assert!(has_image, "ToolResult/Image carrier must remain intact");
+    }
+
     #[tokio::test]
     async fn cancelled_streaming_response_keeps_partial_assistant_message() {
         let cancel = Arc::new(AtomicBool::new(false));
@@ -5588,16 +5760,15 @@ mod tests {
     #[test]
     fn t4_mixed_messages_only_oversized_trimmed() {
         let limit = 5_000;
-        let threshold = limit.max(CTX_TRIM_HEAD + CTX_TRIM_TAIL + 100);
 
         let small = make_tool_result_msg("c1", &"a".repeat(500));
-        let medium = make_tool_result_msg("c2", &"b".repeat(threshold - 1)); // just under threshold
-        let large = make_large_tool_result(threshold + 10_000); // well over threshold
+        let medium = make_tool_result_msg("c2", &"b".repeat((limit - 1) * 4));
+        let large = make_large_tool_result((limit + 2_500) * 4);
         let assistant = make_tool_call_msg("shell", r#"{"command":"ls"}"#);
 
         let mut msgs = vec![small, medium, large, assistant];
         let original_small = "a".repeat(500);
-        let original_medium = "b".repeat(threshold - 1);
+        let original_medium = "b".repeat((limit - 1) * 4);
 
         let changed = compact_trim_tool_results(&mut msgs, limit);
         assert!(
