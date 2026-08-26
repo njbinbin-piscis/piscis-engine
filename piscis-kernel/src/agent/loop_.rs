@@ -796,20 +796,20 @@ impl DefaultCompaction {
         let static_overhead_tokens =
             crate::llm::estimate_request_overhead_tokens(Some(req.system_prompt), req.tool_defs);
         let message_budget = total_budget.saturating_sub(static_overhead_tokens);
-        let single_limit = (message_budget as f64 * CONTEXT_SINGLE_RESULT_SHARE * 4.0) as usize;
 
         let messages = req.messages;
 
         // Build the demoted request view (minimal receipts for older turns)
         // before classifying the request. Micro keeps this request-view-only
         // demotion and never creates a persisted semantic summary.
-        let mut demoted = build_request_messages(
+        let demoted = build_request_view_messages(
             &messages,
             req.tool_minimals,
             CTX_PRESERVE_RECENT_TURNS,
             CTX_KEEP_RECENT_TOOL_CARRIERS,
+            message_budget,
+            req.budget.max_tool_result_tokens,
         );
-        compact_trim_tool_results(&mut demoted, single_limit);
         let req_messages = vision::inject_selected_context(&demoted, req.session_id).await;
         let estimated = crate::llm::estimate_request_input_tokens(
             &req_messages,
@@ -861,11 +861,13 @@ impl DefaultCompaction {
         .await
         {
             Some(compacted) => {
-                let compacted_demoted = build_request_messages(
+                let compacted_demoted = build_request_view_messages(
                     &compacted.messages,
                     req.tool_minimals,
                     CTX_PRESERVE_RECENT_TURNS,
                     CTX_KEEP_RECENT_TOOL_CARRIERS,
+                    message_budget,
+                    req.budget.max_tool_result_tokens,
                 );
                 let compacted_req_messages =
                     vision::inject_selected_context(&compacted_demoted, req.session_id).await;
@@ -1359,13 +1361,15 @@ pub fn build_request_messages(
 
 /// Build the same request-view message slice the live agent uses before an
 /// LLM call: demote older tool results to receipts, then hard-trim oversized
-/// single results against the current message budget.
+/// single results against both the current message budget and the configured
+/// per-result cap. A zero configured cap disables per-result trimming.
 pub fn build_request_view_messages(
     messages: &[LlmMessage],
     tool_minimals: &HashMap<String, String>,
     recent_full_turns: usize,
     recent_tool_carriers: usize,
     message_budget_tokens: usize,
+    max_tool_result_tokens: u32,
 ) -> Vec<LlmMessage> {
     let mut out = build_request_messages(
         messages,
@@ -1373,9 +1377,61 @@ pub fn build_request_view_messages(
         recent_full_turns,
         recent_tool_carriers,
     );
-    let single_limit = (message_budget_tokens as f64 * CONTEXT_SINGLE_RESULT_SHARE * 4.0) as usize;
-    compact_trim_tool_results(&mut out, single_limit);
+    if max_tool_result_tokens != 0 {
+        let dynamic_limit =
+            (message_budget_tokens as f64 * CONTEXT_SINGLE_RESULT_SHARE * 4.0) as usize;
+        let configured_limit = (max_tool_result_tokens as usize).saturating_mul(4);
+        compact_trim_tool_results(&mut out, dynamic_limit.min(configured_limit));
+    }
     out
+}
+
+/// Rebuild rule-based minimal receipts for complete tool exchanges already in
+/// the hydrated history. AgentLoop starts a fresh side-map on every run, so
+/// without this scan only tool calls executed during the current run can ever
+/// be demoted in the request view.
+fn rebuild_tool_receipts_from_messages(
+    messages: &[LlmMessage],
+) -> (HashMap<String, String>, HashMap<String, String>) {
+    let mut calls: HashMap<String, (String, serde_json::Value)> = HashMap::new();
+    let mut minimals = HashMap::new();
+    let mut names = HashMap::new();
+
+    for message in messages {
+        let MessageContent::Blocks(blocks) = &message.content else {
+            continue;
+        };
+        for block in blocks {
+            match block {
+                ContentBlock::ToolUse { id, name, input } => {
+                    calls.insert(id.clone(), (name.clone(), input.clone()));
+                    names.insert(id.clone(), name.clone());
+                }
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                } => {
+                    let (name, input) = calls
+                        .get(tool_use_id)
+                        .map(|(name, input)| (name.as_str(), input))
+                        .unwrap_or(("unknown", &serde_json::Value::Null));
+                    if crate::agent::message_utils::is_ephemeral_tool_call(name, input) {
+                        continue;
+                    }
+                    minimals.insert(
+                        tool_use_id.clone(),
+                        crate::agent::tool_receipt::render_receipt(
+                            name, input, content, *is_error, None,
+                        ),
+                    );
+                }
+                ContentBlock::Text { .. } | ContentBlock::Image { .. } => {}
+            }
+        }
+    }
+
+    (minimals, names)
 }
 
 /// Turn-based boundary: index of the oldest message kept full when the
@@ -1447,12 +1503,7 @@ fn snap_to_pair_boundary(messages: &[LlmMessage], mut start: usize) -> usize {
     let mut guard = 0;
     while start > 0 && guard < 16 {
         let here = &messages[start];
-        let starts_with_tool_result = matches!(
-            &here.content,
-            MessageContent::Blocks(blocks)
-                if blocks.iter().all(|b| matches!(b, ContentBlock::ToolResult { .. }))
-                && !blocks.is_empty()
-        );
+        let starts_with_tool_result = is_tool_result_carrier(here);
         let prev_has_tool_use = matches!(
             &messages[start - 1].content,
             MessageContent::Blocks(blocks) if blocks.iter().any(|b| matches!(b, ContentBlock::ToolUse { .. }))
@@ -1465,6 +1516,34 @@ fn snap_to_pair_boundary(messages: &[LlmMessage], mut start: usize) -> usize {
         break;
     }
     start
+}
+
+/// A provider tool-result carrier may also include image attachments emitted
+/// by that tool. Treat the whole message as the result half of the pair.
+fn is_tool_result_carrier(message: &LlmMessage) -> bool {
+    message.role == "user"
+        && matches!(
+            &message.content,
+            MessageContent::Blocks(blocks)
+                if !blocks.is_empty()
+                    && blocks.iter().any(|block| matches!(block, ContentBlock::ToolResult { .. }))
+                    && blocks.iter().all(|block| matches!(block, ContentBlock::ToolResult { .. } | ContentBlock::Image { .. }))
+        )
+}
+
+/// Pick the semantic-summary boundary while preserving an atomic
+/// ToolUse/ToolResult pair in the recent tail.
+fn summary_split_index(messages: &[LlmMessage], keep_tokens: usize) -> usize {
+    let mut accumulated = 0usize;
+    let mut split_idx = messages.len().saturating_sub(6);
+    for (index, message) in messages.iter().enumerate().rev() {
+        accumulated += crate::llm::estimate_message_tokens(message);
+        if accumulated >= keep_tokens && index > 0 {
+            split_idx = index;
+            break;
+        }
+    }
+    snap_to_pair_boundary(messages, split_idx)
 }
 
 /// Level-2 compaction: call LLM to summarise old messages, optionally merging
@@ -1492,18 +1571,7 @@ pub async fn compact_summarise(
     // keep_tokens. Everything before the boundary index gets summarised.
     // We always keep at least the last 2 messages intact so the LLM has
     // immediate context regardless of how large they are.
-    let mut acc = 0usize;
-    // Default: summarise everything except the last 6 messages (3 tool call rounds).
-    let mut split_idx = messages.len().saturating_sub(6);
-    for (i, msg) in messages.iter().enumerate().rev() {
-        // Use the shared token estimator so every byte we count here matches
-        // the budget math in build_request_messages / estimate_request_input_tokens.
-        acc += crate::llm::estimate_message_tokens(msg);
-        if acc >= keep_tokens && i > 0 {
-            split_idx = i;
-            break;
-        }
-    }
+    let split_idx = summary_split_index(&messages, keep_tokens);
 
     if split_idx == 0 {
         // All messages fit within keep_chars — nothing to summarise.
@@ -1672,16 +1740,7 @@ pub async fn compact_summarise_incremental(
         return None;
     }
 
-    // Reuse the same tail-split math as the legacy path.
-    let mut acc = 0usize;
-    let mut split_idx = messages.len().saturating_sub(6);
-    for (i, msg) in messages.iter().enumerate().rev() {
-        acc += crate::llm::estimate_message_tokens(msg);
-        if acc >= keep_tokens && i > 0 {
-            split_idx = i;
-            break;
-        }
-    }
+    let split_idx = summary_split_index(&messages, keep_tokens);
     if split_idx == 0 {
         return None;
     }
@@ -2736,15 +2795,8 @@ impl AgentLoop {
         // message. The caller persists new_messages to the DB.
         let mut new_messages: Vec<LlmMessage> = Vec::new();
         // Dual-version tool-result side-maps (Phase C). Keyed by `tool_use_id`.
-        // `tool_minimals` carries rule-based minimal receipts; `tool_names_by_id`
-        // is used by `build_request_messages` to run the receipt generator on
-        // legacy messages whose DB row did not yet carry `content_minimal`.
-        //
-        // Scope: lives for the duration of a single `run`. Messages re-hydrated
-        // from the DB backfill on demand in the read path (commands/chat.rs).
-        let mut tool_minimals: HashMap<String, String> = HashMap::new();
-        let mut tool_names_by_id: HashMap<String, String> = HashMap::new();
-
+        // They are seeded from the hydrated history after checkpoint restore,
+        // then extended with results produced during this run.
         // Determine the turn_index for this run once, so all messages share the same index.
         // This must be computed before any messages are written.
         let turn_index: Option<i64> = if let Some(ref db_arc) = self.db {
@@ -2808,6 +2860,9 @@ impl AgentLoop {
                 Err(e) => warn!("Could not load checkpoint: {}", e),
             }
         }
+
+        let (mut tool_minimals, mut tool_names_by_id) =
+            rebuild_tool_receipts_from_messages(&messages);
 
         // Compose the effective system prompt once per run, folding in any
         // wired context-manager / memory-plugin output. Falls back to the base
@@ -2894,9 +2949,6 @@ impl AgentLoop {
                     &tool_defs,
                 );
                 let message_budget = total_budget.saturating_sub(static_overhead_tokens);
-                let single_limit =
-                    (message_budget as f64 * CONTEXT_SINGLE_RESULT_SHARE * 4.0) as usize;
-
                 let outcome = self
                     .compaction_strategy
                     .compact(CompactionRequest {
@@ -2973,13 +3025,14 @@ impl AgentLoop {
                 // Build the (post-compaction) request view + estimate purely
                 // for the UI usage event, so the ring reflects what we're about
                 // to send. This mirrors the view the LLM-call path rebuilds.
-                let mut demoted = build_request_messages(
+                let demoted = build_request_view_messages(
                     &messages,
                     &tool_minimals,
                     CTX_PRESERVE_RECENT_TURNS,
                     CTX_KEEP_RECENT_TOOL_CARRIERS,
+                    message_budget,
+                    self.budget.max_tool_result_tokens,
                 );
-                compact_trim_tool_results(&mut demoted, single_limit);
                 let req_view = vision::inject_selected_context(&demoted, &ctx.session_id).await;
                 let estimated = crate::llm::estimate_request_input_tokens(
                     &req_view,
@@ -3086,17 +3139,26 @@ impl AgentLoop {
                 let mut resp: Option<crate::llm::LlmResponse> = None;
                 let mut succeeded_model: Option<String> = None;
                 let mut context_overflow_attempted = false;
+                let mut model_index = 0usize;
 
-                'model_loop: for model_candidate in &models_to_try {
+                'model_loop: while let Some(model_candidate) = models_to_try.get(model_index) {
                     // Build req_messages inside the model loop so that after
                     // compact_summarise updates `messages`, we use the fresh context.
                     // Tool-result blocks from older turns are swapped to their
                     // minimal receipts before vision-context injection.
-                    let demoted_messages = build_request_messages(
+                    let static_overhead_tokens = crate::llm::estimate_request_overhead_tokens(
+                        Some(&effective_system_prompt),
+                        &tool_defs,
+                    );
+                    let message_budget =
+                        (self.budget.total as usize).saturating_sub(static_overhead_tokens);
+                    let demoted_messages = build_request_view_messages(
                         &messages,
                         &tool_minimals,
                         CTX_PRESERVE_RECENT_TURNS,
                         CTX_KEEP_RECENT_TOOL_CARRIERS,
+                        message_budget,
+                        self.budget.max_tool_result_tokens,
                     );
                     let req_messages =
                         vision::inject_selected_context(&demoted_messages, &ctx.session_id).await;
@@ -3397,6 +3459,7 @@ impl AgentLoop {
                             }
                         }
                     }
+                    model_index += 1;
                 }
                 match resp {
                     Some(r) => {
@@ -4339,10 +4402,11 @@ fn audit_action_label(tool_name: &str, input: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_request_messages, compact_summarise, compact_trim_tool_results, confirm_flags_handle,
-        is_structural_schema_error, maybe_schema_correction_envelope,
-        serialize_tool_results_with_receipts, AgentEvent, AgentLoop, CTX_KEEP_RECENT_TOOL_CARRIERS,
-        CTX_PRESERVE_RECENT_TURNS, CTX_TRIM_HEAD, CTX_TRIM_TAIL, SUMMARY_KEEP_RECENT_RATIO,
+        build_request_messages, build_request_view_messages, compact_summarise,
+        compact_trim_tool_results, confirm_flags_handle, is_structural_schema_error,
+        maybe_schema_correction_envelope, serialize_tool_results_with_receipts, AgentEvent,
+        AgentLoop, CTX_KEEP_RECENT_TOOL_CARRIERS, CTX_PRESERVE_RECENT_TURNS, CTX_TRIM_HEAD,
+        CTX_TRIM_TAIL, SUMMARY_KEEP_RECENT_RATIO,
     };
     use crate::agent::tool::{Tool, ToolContext, ToolRegistry, ToolSettings};
     use crate::llm::{ContentBlock, LlmChunk, LlmMessage, LlmRequest, LlmResponse, MessageContent};
@@ -4531,6 +4595,80 @@ mod tests {
         }
     }
 
+    struct RequestViewSpyClient {
+        semantic_calls: Arc<AtomicUsize>,
+        main_requests: Arc<std::sync::Mutex<Vec<LlmRequest>>>,
+    }
+
+    #[async_trait]
+    impl crate::llm::LlmClient for RequestViewSpyClient {
+        async fn stream(
+            &self,
+            _req: LlmRequest,
+            _tx: tokio::sync::mpsc::Sender<LlmChunk>,
+        ) -> Result<()> {
+            unreachable!("request-view tests drive the non-streaming path")
+        }
+
+        async fn complete(&self, req: LlmRequest) -> Result<LlmResponse> {
+            if req.system.is_none() {
+                self.semantic_calls.fetch_add(1, Ordering::SeqCst);
+                return Ok(LlmResponse {
+                    content: "unexpected semantic summary".into(),
+                    tool_calls: vec![],
+                    input_tokens: 7,
+                    output_tokens: 3,
+                });
+            }
+            self.main_requests.lock().unwrap().push(req);
+            Ok(LlmResponse {
+                content: "main response".into(),
+                tool_calls: vec![],
+                input_tokens: 17,
+                output_tokens: 5,
+            })
+        }
+    }
+
+    struct OverflowRecoverySpyClient {
+        semantic_calls: Arc<AtomicUsize>,
+        main_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl crate::llm::LlmClient for OverflowRecoverySpyClient {
+        async fn stream(
+            &self,
+            _req: LlmRequest,
+            _tx: tokio::sync::mpsc::Sender<LlmChunk>,
+        ) -> Result<()> {
+            unreachable!("overflow tests drive the non-streaming path")
+        }
+
+        async fn complete(&self, req: LlmRequest) -> Result<LlmResponse> {
+            if req.system.is_none() {
+                self.semantic_calls.fetch_add(1, Ordering::SeqCst);
+                return Ok(LlmResponse {
+                    content: "overflow rolling summary".into(),
+                    tool_calls: vec![],
+                    input_tokens: 37,
+                    output_tokens: 11,
+                });
+            }
+
+            let call = self.main_calls.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                return Err(anyhow::anyhow!("context length exceeded"));
+            }
+            Ok(LlmResponse {
+                content: "main response after overflow recovery".into(),
+                tool_calls: vec![],
+                input_tokens: 17,
+                output_tokens: 5,
+            })
+        }
+    }
+
     fn tier_history(
         budget: crate::agent::harness::LayeredBudget,
         target_percent: u32,
@@ -4568,7 +4706,7 @@ mod tests {
     }
 
     fn tier_agent(
-        client: TierRoutingSpyClient,
+        client: impl crate::llm::LlmClient + 'static,
         db: Option<Arc<tokio::sync::Mutex<crate::store::Database>>>,
         budget: crate::agent::harness::LayeredBudget,
     ) -> AgentLoop {
@@ -4798,39 +4936,130 @@ mod tests {
         );
         let semantic_calls = Arc::new(AtomicUsize::new(0));
         let main_calls = Arc::new(AtomicUsize::new(0));
-        let semantic_prompts = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let client = TierRoutingSpyClient {
-            semantic_calls: semantic_calls.clone(),
-            main_calls,
-            semantic_prompts,
-        };
-        let tool_minimals = HashMap::new();
-
-        let outcome = crate::agent::compaction_strategy::CompactionStrategy::compact(
-            &super::DefaultCompaction,
-            crate::agent::compaction_strategy::CompactionRequest {
-                trigger: crate::agent::compaction_strategy::CompactionTrigger::Overflow,
-                budget,
-                messages,
-                rolling_summary: "",
-                system_prompt: TIER_TEST_SYSTEM_PROMPT,
-                model: "test-model",
-                max_tokens: TIER_TEST_MAX_TOKENS,
-                context_window: TIER_TEST_CONTEXT_WINDOW,
-                tool_defs: &[],
-                tool_minimals: &tool_minimals,
-                session_id: "tier-overflow",
-                cumulative_input_tokens: 0,
-                next_auto_compact_threshold: i64::MAX,
-                threshold_step: 0,
-                client: &client,
+        let db = Arc::new(tokio::sync::Mutex::new(
+            crate::store::Database::open_in_memory().expect("in-memory db"),
+        ));
+        let session_id = db
+            .lock()
+            .await
+            .create_session(Some("overflow recovery"))
+            .expect("session")
+            .id;
+        let agent = tier_agent(
+            OverflowRecoverySpyClient {
+                semantic_calls: semantic_calls.clone(),
+                main_calls: main_calls.clone(),
             },
-        )
-        .await;
+            Some(db.clone()),
+            budget,
+        );
 
-        assert!(outcome.changed);
+        let _events = run_tier_agent(agent, messages, session_id.clone()).await;
+
+        assert_eq!(main_calls.load(Ordering::SeqCst), 2);
         assert_eq!(semantic_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(outcome.rolling_summary, "tier rolling summary");
+        let persisted = db
+            .lock()
+            .await
+            .get_session_context_state(&session_id)
+            .expect("context state")
+            .expect("persisted session");
+        assert_eq!(persisted.rolling_summary, "overflow rolling summary");
+        assert_eq!(persisted.rolling_summary_version, 1);
+    }
+
+    #[tokio::test]
+    async fn micro_agent_wire_request_demotes_historical_results_and_caps_recent_result() {
+        let budget = crate::agent::harness::LayeredBudget::with_total(100_000)
+            .with_tier_percents(1, 90, 95)
+            .with_max_tool_result_tokens(1_000);
+        let mut messages = Vec::new();
+        let mut original_old = String::new();
+        for turn in 0..12 {
+            let id = format!("history-call-{turn}");
+            messages.push(make_text_msg("user", &format!("historical request {turn}")));
+            messages.push(LlmMessage {
+                role: "assistant".into(),
+                content: MessageContent::Blocks(vec![
+                    ContentBlock::Text {
+                        text: format!("running historical tool {turn}"),
+                    },
+                    ContentBlock::ToolUse {
+                        id: id.clone(),
+                        name: "shell".into(),
+                        input: json!({"command": format!("echo {turn}")}),
+                    },
+                ]),
+            });
+            let content = if turn == 11 {
+                format!("RECENT_OVERSIZED_RESULT {}", "R".repeat(12_000))
+            } else {
+                format!("HISTORICAL_FULL_RESULT_{turn} {}", "H".repeat(3_000))
+            };
+            if turn == 0 {
+                original_old = content.clone();
+            }
+            messages.push(make_tool_result_msg(&id, &content));
+        }
+        messages.push(make_text_msg("user", "CURRENT_USER_REQUEST_MUST_SURVIVE"));
+
+        let semantic_calls = Arc::new(AtomicUsize::new(0));
+        let main_requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let agent = tier_agent(
+            RequestViewSpyClient {
+                semantic_calls: semantic_calls.clone(),
+                main_requests: main_requests.clone(),
+            },
+            None,
+            budget,
+        );
+
+        let events = run_tier_agent(agent, messages, "micro-wire".into()).await;
+
+        assert_eq!(semantic_calls.load(Ordering::SeqCst), 0);
+        let requests = main_requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let wire_messages = &requests[0].messages;
+        let tool_result_content = |wanted_id: &str| {
+            wire_messages
+                .iter()
+                .find_map(|message| match &message.content {
+                    MessageContent::Blocks(blocks) => blocks.iter().find_map(|block| match block {
+                        ContentBlock::ToolResult {
+                            tool_use_id,
+                            content,
+                            ..
+                        } if tool_use_id == wanted_id => Some(content.as_str()),
+                        _ => None,
+                    }),
+                    MessageContent::Text(_) => None,
+                })
+        };
+        let old = tool_result_content("history-call-0").expect("historical result on wire");
+        assert_ne!(old, original_old);
+        assert!(old.contains("[recall:history-call-0]"));
+        let recent =
+            tool_result_content("history-call-11").expect("recent oversized result on wire");
+        assert!(recent.contains("chars removed"));
+        assert!(wire_messages.iter().any(|message| {
+            matches!(&message.content, MessageContent::Text(text) if text == "CURRENT_USER_REQUEST_MUST_SURVIVE")
+        }));
+        let reported_estimate = events
+            .iter()
+            .find_map(|event| match event {
+                AgentEvent::ContextUsage {
+                    estimated_input_tokens,
+                    ..
+                } => Some(*estimated_input_tokens),
+                _ => None,
+            })
+            .expect("ContextUsage event");
+        let wire_estimate = crate::llm::estimate_request_input_tokens(
+            wire_messages,
+            requests[0].system.as_deref(),
+            &requests[0].tools,
+        );
+        assert_eq!(reported_estimate as usize, wire_estimate);
     }
 
     #[tokio::test]
@@ -5643,6 +5872,99 @@ mod tests {
         );
     }
 
+    fn tool_use_carrier(id: &str) -> LlmMessage {
+        LlmMessage {
+            role: "assistant".into(),
+            content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                id: id.into(),
+                name: "shell".into(),
+                input: json!({"command": "echo atomic"}),
+            }]),
+        }
+    }
+
+    #[tokio::test]
+    async fn compact_summarise_keeps_tool_use_and_result_atomic_at_split() {
+        let latest_request = make_text_msg("user", "LATEST_USER_REQUEST_MUST_SURVIVE");
+        let keep_tokens = crate::llm::estimate_message_tokens(&latest_request) + 1;
+        let messages = vec![
+            make_text_msg("user", "old history to summarise"),
+            tool_use_carrier("atomic-call"),
+            make_tool_result_msg("atomic-call", &"result ".repeat(200)),
+            latest_request,
+        ];
+        let client = MockLlmClient::new("atomic rolling summary");
+
+        let outcome = compact_summarise(messages, keep_tokens, &client, "test-model", 1_024, None)
+            .await
+            .expect("compaction outcome");
+
+        assert!(matches!(
+            &outcome.messages[1].content,
+            MessageContent::Blocks(blocks)
+                if blocks.iter().any(|block| matches!(block, ContentBlock::ToolUse { id, .. } if id == "atomic-call"))
+        ));
+        assert!(matches!(
+            &outcome.messages[2].content,
+            MessageContent::Blocks(blocks)
+                if blocks.iter().any(|block| matches!(block, ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "atomic-call"))
+        ));
+        assert!(matches!(
+            &outcome.messages[3].content,
+            MessageContent::Text(text) if text == "LATEST_USER_REQUEST_MUST_SURVIVE"
+        ));
+    }
+
+    #[tokio::test]
+    async fn compact_summarise_keeps_tool_result_image_carrier_atomic_at_split() {
+        let latest_request = make_text_msg("user", "LATEST_MIXED_USER_REQUEST_MUST_SURVIVE");
+        let keep_tokens = crate::llm::estimate_message_tokens(&latest_request) + 1;
+        let mixed_result = LlmMessage {
+            role: "user".into(),
+            content: MessageContent::Blocks(vec![
+                ContentBlock::ToolResult {
+                    tool_use_id: "mixed-call".into(),
+                    content: "mixed result ".repeat(200),
+                    is_error: false,
+                },
+                ContentBlock::Image {
+                    source: crate::llm::ImageSource {
+                        source_type: "base64".into(),
+                        media_type: "image/png".into(),
+                        data: "aGVsbG8=".into(),
+                    },
+                },
+            ]),
+        };
+        let messages = vec![
+            make_text_msg("user", "old mixed history to summarise"),
+            tool_use_carrier("mixed-call"),
+            mixed_result,
+            latest_request,
+        ];
+        let client = MockLlmClient::new("mixed atomic rolling summary");
+
+        let outcome = compact_summarise(messages, keep_tokens, &client, "test-model", 1_024, None)
+            .await
+            .expect("compaction outcome");
+
+        assert!(matches!(
+            &outcome.messages[1].content,
+            MessageContent::Blocks(blocks)
+                if blocks.iter().any(|block| matches!(block, ContentBlock::ToolUse { id, .. } if id == "mixed-call"))
+        ));
+        assert!(matches!(
+            &outcome.messages[2].content,
+            MessageContent::Blocks(blocks)
+                if blocks.iter().any(|block| matches!(block, ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "mixed-call"))
+                    && blocks.iter().any(|block| matches!(block, ContentBlock::Image { .. }))
+        ));
+        assert!(matches!(
+            &outcome.messages[3].content,
+            MessageContent::Text(text) if text == "LATEST_MIXED_USER_REQUEST_MUST_SURVIVE"
+        ));
+    }
+
     // ── Phase C: build_request_messages ───────────────────────────────────────
 
     fn user_text(text: &str) -> LlmMessage {
@@ -5899,6 +6221,26 @@ mod tests {
                 assert_eq!(content, "LONG 1");
             }
         }
+    }
+
+    #[test]
+    fn request_view_zero_tool_result_cap_disables_trimming() {
+        let full = format!("UNTRIMMED {}", "x".repeat(20_000));
+        let messages = vec![tool_result_carrier("no-cap", &full)];
+        let request_view = build_request_view_messages(
+            &messages,
+            &HashMap::new(),
+            CTX_PRESERVE_RECENT_TURNS,
+            CTX_KEEP_RECENT_TOOL_CARRIERS,
+            1_000,
+            0,
+        );
+
+        assert!(matches!(
+            &request_view[0].content,
+            MessageContent::Blocks(blocks)
+                if matches!(&blocks[0], ContentBlock::ToolResult { content, .. } if content == &full)
+        ));
     }
 
     #[test]

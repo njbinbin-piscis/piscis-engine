@@ -58,6 +58,9 @@ pub struct LayeredBudget {
     pub trigger_auto: u32,
     pub trigger_full: u32,
     pub max_tool_result_tokens: u32,
+    micro_percent: u8,
+    auto_percent: u8,
+    full_percent: u8,
 }
 
 impl LayeredBudget {
@@ -75,6 +78,9 @@ impl LayeredBudget {
             trigger_auto: percent_of(total, DEFAULT_TIER_AUTO_PERCENT),
             trigger_full: percent_of(total, DEFAULT_TIER_FULL_PERCENT),
             max_tool_result_tokens: DEFAULT_MAX_TOOL_RESULT_TOKENS,
+            micro_percent: DEFAULT_TIER_MICRO_PERCENT,
+            auto_percent: DEFAULT_TIER_AUTO_PERCENT,
+            full_percent: DEFAULT_TIER_FULL_PERCENT,
         }
     }
 
@@ -91,13 +97,21 @@ impl LayeredBudget {
         self.trigger_micro = percent_of(self.total, micro);
         self.trigger_auto = percent_of(self.total, auto);
         self.trigger_full = percent_of(self.total, full);
+        self.micro_percent = micro;
+        self.auto_percent = auto;
+        self.full_percent = full;
         self
     }
 
     /// Override the single-tool-result hard cap.
     pub fn with_max_tool_result_tokens(mut self, v: u32) -> Self {
-        self.max_tool_result_tokens = v.clamp(1_000, 64_000);
+        self.max_tool_result_tokens = if v == 0 { 0 } else { v.clamp(1_000, 64_000) };
         self
+    }
+
+    /// Return the lossless tier percentages used to derive the thresholds.
+    pub(crate) fn tier_percents(&self) -> (u8, u8, u8) {
+        (self.micro_percent, self.auto_percent, self.full_percent)
     }
 
     /// Classify an estimated request size into a tier.
@@ -178,6 +192,8 @@ mod tests {
 
     #[test]
     fn budget_max_tool_result_tokens_clamp() {
+        let b = LayeredBudget::with_total(100_000).with_max_tool_result_tokens(0);
+        assert_eq!(b.max_tool_result_tokens, 0, "zero disables the cap");
         let b = LayeredBudget::with_total(100_000).with_max_tool_result_tokens(500);
         assert_eq!(b.max_tool_result_tokens, 1_000);
         let b = LayeredBudget::with_total(100_000).with_max_tool_result_tokens(200_000);

@@ -742,28 +742,11 @@ impl HarnessConfigBuilder {
         // Re-derive caps from the current (context_window, max_tokens)
         // while preserving any previously-set tier percents / tool cap.
         let prev = self.inner.budget;
-        let new =
-            LayeredBudget::from_context_window(self.inner.context_window, self.inner.max_tokens);
-        // Preserve overrides if they diverged from defaults.
-        let micro_pct = pct_of(prev.trigger_micro, prev.total);
-        let auto_pct = pct_of(prev.trigger_auto, prev.total);
-        let full_pct = pct_of(prev.trigger_full, prev.total);
-        let mut new = new;
-        if prev.total > 0 && micro_pct > 0 && auto_pct > micro_pct && full_pct > auto_pct {
-            new = new.with_tier_percents(micro_pct, auto_pct, full_pct);
-        }
-        if prev.max_tool_result_tokens != super::budget::DEFAULT_MAX_TOOL_RESULT_TOKENS {
-            new = new.with_max_tool_result_tokens(prev.max_tool_result_tokens);
-        }
-        self.inner.budget = new;
-    }
-}
-
-fn pct_of(value: u32, total: u32) -> u8 {
-    if total == 0 {
-        0
-    } else {
-        (((value as u64 * 100 + total as u64 / 2) / total as u64).min(100)) as u8
+        let (micro_percent, auto_percent, full_percent) = prev.tier_percents();
+        self.inner.budget =
+            LayeredBudget::from_context_window(self.inner.context_window, self.inner.max_tokens)
+                .with_tier_percents(micro_percent, auto_percent, full_percent)
+                .with_max_tool_result_tokens(prev.max_tool_result_tokens);
     }
 }
 
@@ -864,6 +847,45 @@ mod tests {
             agent.budget.max_tool_result_tokens,
             budget.max_tool_result_tokens
         );
+    }
+
+    #[test]
+    fn builder_refresh_preserves_custom_percents_through_101_and_tiny_totals() {
+        let (reg, policy) = scaffolding();
+        let budget = HarnessConfig::builder("main", "test-model", reg, policy)
+            .with_context_window(120)
+            .with_max_tokens(1)
+            .with_tier_percents(55, 75, 92)
+            .with_context_window(3)
+            .with_max_tokens(1)
+            .with_context_window(32_000)
+            .with_max_tokens(4_096)
+            .with_context_window(128_000)
+            .with_max_tokens(16_384)
+            .build()
+            .budget;
+
+        assert_eq!(budget.trigger_micro, budget.total * 55 / 100);
+        assert_eq!(budget.trigger_auto, budget.total * 75 / 100);
+        assert_eq!(budget.trigger_full, budget.total * 92 / 100);
+    }
+
+    #[test]
+    fn builder_refresh_preserves_default_percents_through_101_and_tiny_totals() {
+        let (reg, policy) = scaffolding();
+        let budget = HarnessConfig::builder("main", "test-model", reg, policy)
+            .with_context_window(120)
+            .with_max_tokens(1)
+            .with_context_window(3)
+            .with_max_tokens(1)
+            .with_context_window(128_000)
+            .with_max_tokens(16_384)
+            .build()
+            .budget;
+
+        assert_eq!(budget.trigger_micro, budget.total * 60 / 100);
+        assert_eq!(budget.trigger_auto, budget.total * 80 / 100);
+        assert_eq!(budget.trigger_full, budget.total * 95 / 100);
     }
 
     #[test]
