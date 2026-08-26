@@ -185,21 +185,51 @@ fn is_valid_file_uri_host(host: &str) -> bool {
     if host.parse::<std::net::Ipv4Addr>().is_ok() {
         return true;
     }
-    if host
-        .bytes()
-        .all(|byte| byte.is_ascii_digit() || byte == b'.')
-    {
+    is_valid_file_uri_reg_name(host)
+}
+
+fn is_valid_file_uri_reg_name(host: &str) -> bool {
+    let bytes = host.as_bytes();
+    if bytes.is_empty() {
         return false;
     }
 
-    host.split('.').all(|label| {
-        !label.is_empty()
-            && !label.starts_with('-')
-            && !label.ends_with('-')
-            && label
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-    })
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == b'%' {
+            if index + 2 >= bytes.len() {
+                return false;
+            }
+            let Some(high) = hex_value(bytes[index + 1]) else {
+                return false;
+            };
+            let Some(low) = hex_value(bytes[index + 2]) else {
+                return false;
+            };
+            let decoded = (high << 4) | low;
+            if decoded < b' '
+                || decoded == 0x7f
+                || matches!(decoded, b'@' | b':' | b'/' | b'\\' | b'?' | b'#')
+            {
+                return false;
+            }
+            index += 3;
+            continue;
+        }
+
+        let unreserved = byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~');
+        let sub_delim = matches!(
+            byte,
+            b'!' | b'$' | b'&' | b'\'' | b'(' | b')' | b'*' | b'+' | b',' | b';' | b'='
+        );
+        if !unreserved && !sub_delim {
+            return false;
+        }
+        index += 1;
+    }
+
+    true
 }
 
 fn is_valid_file_uri_unc_path(path: &str) -> bool {
@@ -276,18 +306,22 @@ fn is_valid_windows_component(component: &str) -> bool {
 
 fn is_windows_dos_device_component(component: &str) -> bool {
     let basename = component.split('.').next().unwrap_or_default();
-    if ["CON", "PRN", "AUX", "NUL", "CLOCK$"]
+    if ["CON", "PRN", "AUX", "NUL", "CLOCK$", "CONIN$", "CONOUT$"]
         .iter()
         .any(|device| basename.eq_ignore_ascii_case(device))
     {
         return true;
     }
 
-    let uppercase = basename.to_ascii_uppercase();
-    let bytes = uppercase.as_bytes();
-    bytes.len() == 4
-        && (bytes.starts_with(b"COM") || bytes.starts_with(b"LPT"))
-        && matches!(bytes[3], b'1'..=b'9')
+    let mut characters = basename.chars();
+    let prefix: String = characters.by_ref().take(3).collect();
+    if !prefix.eq_ignore_ascii_case("COM") && !prefix.eq_ignore_ascii_case("LPT") {
+        return false;
+    }
+    matches!(
+        (characters.next(), characters.next()),
+        (Some('1'..='9' | '¹' | '²' | '³'), None)
+    )
 }
 
 fn has_uri_scheme(value: &str) -> bool {
@@ -5802,7 +5836,10 @@ mod tests {
             "file://localhost/C:/a".to_string(),
             "file://host/share/path".to_string(),
             "file://127.0.0.1/share/path".to_string(),
+            "file://999.999.999.999/share/path".to_string(),
             "file://[::1]/share/path".to_string(),
+            "file://name_with~sub!$&'()*+,;=/share/path".to_string(),
+            "file://pct%2Dhost/share/path".to_string(),
             r"C:\files\local.bin".to_string(),
             r"\\host\share\local.bin".to_string(),
             platform_absolute,
@@ -5816,7 +5853,7 @@ mod tests {
                 .expect("read session")
                 .expect("session exists")
                 .message_count,
-            12
+            15
         );
     }
 
@@ -5834,12 +5871,16 @@ mod tests {
             "file://host:445/share/path",
             "file://user@host/share/path",
             "file://127.0.0.1:445/share/path",
-            "file://999.999.999.999/share/path",
             "file://[:::1]/share/path",
             "file://[::1]:445/share/path",
             "file://[::1/share/path",
+            "file://bad%40host/share/path",
+            "file://bad%3Ahost/share/path",
+            "file://bad%2Fhost/share/path",
+            "file://bad%5Chost/share/path",
+            "file://bad%00host/share/path",
+            "file://bad%2host/share/path",
             r"file://host\share\path",
-            "file://bad_host/share/path",
             "file://host",
             "file://host/",
             "file:///a?token=secret",
@@ -5887,6 +5928,11 @@ mod tests {
         let session = db.create_session(Some("DOS devices")).expect("session");
 
         for uri in [
+            r"C:\CONIN$",
+            r"C:\CONOUT$.txt",
+            r"C:\COM¹.txt",
+            "file:///C:/LPT².log",
+            r"\\host\share\COM³.bin",
             r"C:\NUL",
             r"C:\CON.txt",
             r"c:\prn.PDF",
@@ -5917,6 +5963,36 @@ mod tests {
                 0
             );
         }
+    }
+
+    #[test]
+    fn attachment_paths_allow_non_device_lookalikes() {
+        let db = Database::open_in_memory().expect("in-memory db");
+        let session = db
+            .create_session(Some("DOS device lookalikes"))
+            .expect("session");
+
+        for uri in [
+            r"C:\COM0.txt",
+            r"C:\COM10.txt",
+            r"C:\LPT0.log",
+            r"C:\LPT10.log",
+            r"C:\COM⁴.txt",
+            r"C:\CONSOLE.txt",
+            r"C:\CONINBOX.txt",
+            "file:///C:/AUXILIARY.txt",
+        ] {
+            let attachments = attachment_json(uri, "ordinary.bin");
+            db.append_message_with_attachments(&session.id, "user", uri, Some(&attachments))
+                .unwrap_or_else(|error| panic!("{uri:?} should remain valid: {error:#}"));
+        }
+        assert_eq!(
+            db.get_session(&session.id)
+                .expect("read session")
+                .expect("session exists")
+                .message_count,
+            8
+        );
     }
 
     #[test]
