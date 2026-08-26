@@ -5,6 +5,151 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use uuid::Uuid;
 
+const MAX_ATTACHMENTS_JSON_BYTES: usize = 64 * 1024;
+
+fn validate_attachments_json(attachments_json: &str) -> Result<()> {
+    if attachments_json.is_empty() {
+        anyhow::bail!("attachments_json must not be empty");
+    }
+    if attachments_json.len() > MAX_ATTACHMENTS_JSON_BYTES {
+        anyhow::bail!("attachments_json exceeds the 64 KiB limit");
+    }
+
+    let value: serde_json::Value =
+        serde_json::from_str(attachments_json).context("attachments_json must be valid JSON")?;
+    let attachments = value
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("attachments_json must be a JSON array"))?;
+    const ALLOWED_FIELDS: [&str; 5] = ["media_type", "filename", "uri", "size", "sha256"];
+
+    for (index, attachment) in attachments.iter().enumerate() {
+        let object = attachment
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("attachment {index} must be a JSON object"))?;
+        if object.len() != ALLOWED_FIELDS.len()
+            || !object
+                .keys()
+                .all(|key| ALLOWED_FIELDS.contains(&key.as_str()))
+        {
+            anyhow::bail!(
+                "attachment {index} must contain only media_type, filename, uri, size, and sha256"
+            );
+        }
+
+        for field in ["media_type", "filename"] {
+            if object
+                .get(field)
+                .and_then(serde_json::Value::as_str)
+                .is_none()
+            {
+                anyhow::bail!("attachment {index} field {field} must be a string");
+            }
+        }
+        if object
+            .get("size")
+            .and_then(serde_json::Value::as_u64)
+            .is_none()
+        {
+            anyhow::bail!("attachment {index} field size must be a non-negative integer");
+        }
+
+        let sha256 = object
+            .get("sha256")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("attachment {index} field sha256 must be a string"))?;
+        if sha256.len() != 64 || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            anyhow::bail!("attachment {index} field sha256 must be 64 hexadecimal characters");
+        }
+
+        let uri = object
+            .get("uri")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("attachment {index} field uri must be a string"))?;
+        if !is_stable_local_attachment_uri(uri) {
+            anyhow::bail!(
+                "attachment {index} uri must be a stable absolute local path or file URI"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn is_stable_local_attachment_uri(uri: &str) -> bool {
+    if uri.is_empty() || contains_sensitive_uri_parameter(uri) {
+        return false;
+    }
+
+    let lowercase = uri.to_ascii_lowercase();
+    if lowercase.starts_with("file:") {
+        return is_valid_file_uri(uri);
+    }
+    if is_native_absolute_path(uri) {
+        return true;
+    }
+
+    false
+}
+
+fn is_valid_file_uri(uri: &str) -> bool {
+    if uri.contains(['?', '#']) {
+        return false;
+    }
+
+    let path = &uri["file:".len()..];
+    if let Some(unc) = path.strip_prefix("//") {
+        let authority_end = unc.find(['/', '\\']).unwrap_or(unc.len());
+        if unc[..authority_end].contains('@') {
+            return false;
+        }
+        return unc
+            .split(['/', '\\'])
+            .filter(|component| !component.is_empty())
+            .count()
+            >= 2;
+    }
+
+    is_native_absolute_path(path)
+}
+
+fn is_native_absolute_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    let windows_drive_absolute = bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'/' | b'\\');
+    let windows_unc_absolute = path.starts_with(r"\\")
+        && path[2..]
+            .split(['/', '\\'])
+            .filter(|component| !component.is_empty())
+            .count()
+            >= 2;
+
+    windows_drive_absolute || windows_unc_absolute || Path::new(path).is_absolute()
+}
+
+fn contains_sensitive_uri_parameter(uri: &str) -> bool {
+    let lowercase = uri.to_ascii_lowercase();
+    [
+        "token=",
+        "token%3d",
+        "signature=",
+        "signature%3d",
+        "credential=",
+        "credential%3d",
+        "api_key=",
+        "api_key%3d",
+        "apikey=",
+        "apikey%3d",
+        "secret=",
+        "secret%3d",
+        "password=",
+        "password%3d",
+    ]
+    .iter()
+    .any(|parameter| lowercase.contains(parameter))
+}
+
 fn normalize_koi_name(name: &str) -> Result<String> {
     let trimmed = name.trim();
     if trimmed.is_empty() {
@@ -138,6 +283,9 @@ pub struct ChatMessage {
     /// A "turn" starts with each user message.
     #[serde(default)]
     pub turn_index: Option<i64>,
+    /// JSON array of validated local attachment metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachments_json: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -440,6 +588,7 @@ impl Database {
                 role TEXT NOT NULL,
                 content TEXT NOT NULL,
                 created_at TEXT NOT NULL,
+                attachments_json TEXT NULL,
                 FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
             );
 
@@ -646,6 +795,9 @@ impl Database {
         let _ = self
             .conn
             .execute("ALTER TABLE messages ADD COLUMN turn_index INTEGER", []);
+        let _ = self
+            .conn
+            .execute("ALTER TABLE messages ADD COLUMN attachments_json TEXT", []);
 
         // Agent checkpoints for crash recovery
         self.conn.execute_batch("
@@ -1084,7 +1236,7 @@ impl Database {
             WHERE rowid NOT IN (
                 SELECT MIN(rowid)
                 FROM messages
-                GROUP BY session_id, role, content, COALESCE(tool_calls_json,''), COALESCE(tool_results_json,'')
+                GROUP BY session_id, role, content, COALESCE(tool_calls_json,''), COALESCE(tool_results_json,''), COALESCE(attachments_json,'')
             );
         ");
 
@@ -1641,7 +1793,26 @@ impl Database {
         role: &str,
         content: &str,
     ) -> Result<ChatMessage> {
-        self.append_message_full(session_id, role, content, None, None, None)
+        self.append_message_with_attachments(session_id, role, content, None)
+    }
+
+    /// Persist a message with validated local attachment metadata.
+    pub fn append_message_with_attachments(
+        &self,
+        session_id: &str,
+        role: &str,
+        content: &str,
+        attachments_json: Option<&str>,
+    ) -> Result<ChatMessage> {
+        self.append_message_full_with_attachments(
+            session_id,
+            role,
+            content,
+            None,
+            None,
+            None,
+            attachments_json,
+        )
     }
 
     /// Persist a message with optional tool call data and turn index.
@@ -1657,13 +1828,40 @@ impl Database {
         tool_results_json: Option<&str>,
         turn_index: Option<i64>,
     ) -> Result<ChatMessage> {
+        self.append_message_full_with_attachments(
+            session_id,
+            role,
+            content,
+            tool_calls_json,
+            tool_results_json,
+            turn_index,
+            None,
+        )
+    }
+
+    /// Persist a message with optional tool metadata, turn index, and attachments.
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_message_full_with_attachments(
+        &self,
+        session_id: &str,
+        role: &str,
+        content: &str,
+        tool_calls_json: Option<&str>,
+        tool_results_json: Option<&str>,
+        turn_index: Option<i64>,
+        attachments_json: Option<&str>,
+    ) -> Result<ChatMessage> {
+        if let Some(attachments_json) = attachments_json {
+            validate_attachments_json(attachments_json)?;
+        }
+
         let id = Uuid::new_v4().to_string();
         let now = Utc::now();
         let now_str = now.to_rfc3339();
         self.conn.execute(
-            "INSERT INTO messages (id, session_id, role, content, created_at, tool_calls_json, tool_results_json, turn_index) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![id, session_id, role, content, now_str, tool_calls_json, tool_results_json, turn_index],
+            "INSERT INTO messages (id, session_id, role, content, created_at, tool_calls_json, tool_results_json, turn_index, attachments_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![id, session_id, role, content, now_str, tool_calls_json, tool_results_json, turn_index, attachments_json],
         )?;
         // Update session message count and updated_at
         self.conn.execute(
@@ -1679,6 +1877,7 @@ impl Database {
             tool_calls_json: tool_calls_json.map(|s| s.to_string()),
             tool_results_json: tool_results_json.map(|s| s.to_string()),
             turn_index,
+            attachments_json: attachments_json.map(|s| s.to_string()),
         })
     }
 
@@ -1723,7 +1922,7 @@ impl Database {
         // Sort by rowid (insert order) rather than created_at to be robust against
         // system clock drift. See `get_messages_latest` for full rationale.
         let mut stmt = self.conn.prepare(
-            "SELECT id, session_id, role, content, created_at, tool_calls_json, tool_results_json, turn_index \
+            "SELECT id, session_id, role, content, created_at, tool_calls_json, tool_results_json, turn_index, attachments_json \
              FROM messages WHERE session_id = ?1 ORDER BY rowid ASC LIMIT ?2 OFFSET ?3"
         )?;
         let rows = stmt.query_map(params![session_id, limit, offset], |r| {
@@ -1739,6 +1938,7 @@ impl Database {
                 tool_calls_json: r.get(5)?,
                 tool_results_json: r.get(6)?,
                 turn_index: r.get(7)?,
+                attachments_json: r.get(8)?,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -1755,12 +1955,12 @@ impl Database {
         offset: i64,
     ) -> Result<Vec<ChatMessage>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, session_id, role, content, created_at, tool_calls_json, tool_results_json, turn_index \
+            "SELECT id, session_id, role, content, created_at, tool_calls_json, tool_results_json, turn_index, attachments_json \
              FROM ( \
-               SELECT id, session_id, role, content, created_at, tool_calls_json, tool_results_json, turn_index \
+               SELECT rowid AS insertion_rowid, id, session_id, role, content, created_at, tool_calls_json, tool_results_json, turn_index, attachments_json \
                FROM messages WHERE session_id = ?1 \
                ORDER BY rowid DESC LIMIT ?2 OFFSET ?3 \
-             ) ORDER BY rowid ASC",
+             ) AS older ORDER BY older.insertion_rowid ASC",
         )?;
         let rows = stmt.query_map(params![session_id, limit, offset], |r| {
             Ok(ChatMessage {
@@ -1775,6 +1975,7 @@ impl Database {
                 tool_calls_json: r.get(5)?,
                 tool_results_json: r.get(6)?,
                 turn_index: r.get(7)?,
+                attachments_json: r.get(8)?,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -1793,7 +1994,7 @@ impl Database {
     /// to clock skew.
     pub fn get_messages_latest(&self, session_id: &str, limit: i64) -> Result<Vec<ChatMessage>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, session_id, role, content, created_at, tool_calls_json, tool_results_json, turn_index \
+            "SELECT id, session_id, role, content, created_at, tool_calls_json, tool_results_json, turn_index, attachments_json \
              FROM messages WHERE session_id = ?1 ORDER BY rowid DESC LIMIT ?2"
         )?;
         let rows = stmt.query_map(params![session_id, limit], |r| {
@@ -1809,6 +2010,7 @@ impl Database {
                 tool_calls_json: r.get(5)?,
                 tool_results_json: r.get(6)?,
                 turn_index: r.get(7)?,
+                attachments_json: r.get(8)?,
             })
         })?;
         let mut msgs: Vec<ChatMessage> = rows.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -4942,6 +5144,398 @@ mod tests {
     use super::{
         is_disallowed_koi_name_char, normalize_koi_name, Database, ImSessionBindingUpsert,
     };
+
+    const ATTACHMENT_SHA256: &str =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    fn attachment_json(uri: &str, filename: &str) -> String {
+        serde_json::json!([{
+            "media_type": "application/pdf",
+            "filename": filename,
+            "uri": uri,
+            "size": 42,
+            "sha256": ATTACHMENT_SHA256,
+        }])
+        .to_string()
+    }
+
+    #[test]
+    fn get_messages_older_returns_previous_page_in_insert_order() {
+        let db = Database::open_in_memory().expect("in-memory db");
+        let session = db.create_session(Some("History")).expect("session");
+        for content in ["m1", "m2", "m3", "m4"] {
+            db.append_message(&session.id, "user", content)
+                .expect("append message");
+        }
+
+        let older = db
+            .get_messages_older(&session.id, 2, 1)
+            .expect("older page");
+        let contents: Vec<&str> = older
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect();
+        assert_eq!(contents, ["m2", "m3"]);
+    }
+
+    #[test]
+    fn latest_and_older_pages_reconstruct_insert_order_without_duplicates() {
+        let db = Database::open_in_memory().expect("in-memory db");
+        let session = db.create_session(Some("History")).expect("session");
+        for content in ["m1", "m2", "m3", "m4"] {
+            db.append_message(&session.id, "user", content)
+                .expect("append message");
+        }
+
+        let latest = db.get_messages_latest(&session.id, 2).expect("latest page");
+        let older = db
+            .get_messages_older(&session.id, 2, latest.len() as i64)
+            .expect("older page");
+        let contents: Vec<&str> = older
+            .iter()
+            .chain(latest.iter())
+            .map(|message| message.content.as_str())
+            .collect();
+        assert_eq!(contents, ["m1", "m2", "m3", "m4"]);
+    }
+
+    #[test]
+    fn message_attachments_roundtrip_through_all_history_queries() {
+        let db = Database::open_in_memory().expect("in-memory db");
+        let session = db.create_session(Some("Attachments")).expect("session");
+        let attachments = attachment_json(r"C:\files\report.pdf", "report.pdf");
+
+        let appended = db
+            .append_message_with_attachments(
+                &session.id,
+                "user",
+                "see attachment",
+                Some(&attachments),
+            )
+            .expect("append attachment message");
+        assert_eq!(
+            appended.attachments_json.as_deref(),
+            Some(attachments.as_str())
+        );
+
+        for messages in [
+            db.get_messages(&session.id, 10, 0).expect("all messages"),
+            db.get_messages_latest(&session.id, 10)
+                .expect("latest messages"),
+            db.get_messages_older(&session.id, 10, 0)
+                .expect("older messages"),
+        ] {
+            assert_eq!(messages.len(), 1);
+            assert_eq!(
+                messages[0].attachments_json.as_deref(),
+                Some(attachments.as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn full_attachment_api_preserves_tool_and_turn_metadata() {
+        let db = Database::open_in_memory().expect("in-memory db");
+        let session = db.create_session(Some("Attachments")).expect("session");
+        let attachments = attachment_json(r"C:\files\tool-output.json", "tool-output.json");
+
+        let message = db
+            .append_message_full_with_attachments(
+                &session.id,
+                "assistant",
+                "tool output",
+                Some(r#"[{"type":"tool_use"}]"#),
+                Some(r#"[{"type":"tool_result"}]"#),
+                Some(7),
+                Some(&attachments),
+            )
+            .expect("append full attachment message");
+
+        assert_eq!(
+            message.tool_calls_json.as_deref(),
+            Some(r#"[{"type":"tool_use"}]"#)
+        );
+        assert_eq!(
+            message.tool_results_json.as_deref(),
+            Some(r#"[{"type":"tool_result"}]"#)
+        );
+        assert_eq!(message.turn_index, Some(7));
+        assert_eq!(
+            message.attachments_json.as_deref(),
+            Some(attachments.as_str())
+        );
+
+        let existing_full = db
+            .append_message_full(
+                &session.id,
+                "assistant",
+                "legacy full API",
+                Some(r#"[{"type":"tool_use","id":"existing"}]"#),
+                Some(r#"[{"type":"tool_result","id":"existing"}]"#),
+                Some(8),
+            )
+            .expect("append through existing full API");
+        assert_eq!(
+            existing_full.tool_calls_json.as_deref(),
+            Some(r#"[{"type":"tool_use","id":"existing"}]"#)
+        );
+        assert_eq!(
+            existing_full.tool_results_json.as_deref(),
+            Some(r#"[{"type":"tool_result","id":"existing"}]"#)
+        );
+        assert_eq!(existing_full.turn_index, Some(8));
+        assert!(existing_full.attachments_json.is_none());
+    }
+
+    #[test]
+    fn additive_attachment_migration_keeps_legacy_rows_readable() {
+        let db = Database::open_in_memory().expect("in-memory db");
+        let session = db.create_session(Some("Legacy")).expect("session");
+        let now = chrono::Utc::now().to_rfc3339();
+        db.conn
+            .execute_batch(
+                "DROP TABLE messages;
+                 CREATE TABLE messages (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+                 );",
+            )
+            .expect("recreate legacy messages table");
+        db.conn
+            .execute(
+                "INSERT INTO messages (id, session_id, role, content, created_at)
+                 VALUES ('legacy-message', ?1, 'user', 'legacy', ?2)",
+                rusqlite::params![session.id, now],
+            )
+            .expect("insert legacy row");
+
+        db.migrate().expect("run additive migration");
+        db.migrate().expect("migration is repeatable");
+
+        let messages = db
+            .get_messages(&session.id, 10, 0)
+            .expect("read legacy row");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content, "legacy");
+        assert!(messages[0].attachments_json.is_none());
+    }
+
+    #[test]
+    fn message_dedup_keeps_rows_with_different_attachments() {
+        let db = Database::open_in_memory().expect("in-memory db");
+        let session = db.create_session(Some("Dedup")).expect("session");
+        let first = attachment_json(r"C:\files\first.pdf", "first.pdf");
+        let second = attachment_json(r"C:\files\second.pdf", "second.pdf");
+
+        for attachments in [&first, &second] {
+            db.append_message_with_attachments(
+                &session.id,
+                "user",
+                "same content",
+                Some(attachments),
+            )
+            .expect("append duplicate candidate");
+        }
+        db.migrate().expect("rerun dedup migration");
+
+        let messages = db
+            .get_messages(&session.id, 10, 0)
+            .expect("read deduplicated rows");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(
+            messages[0].attachments_json.as_deref(),
+            Some(first.as_str())
+        );
+        assert_eq!(
+            messages[1].attachments_json.as_deref(),
+            Some(second.as_str())
+        );
+    }
+
+    #[test]
+    fn attachment_validation_accepts_supported_local_uri_forms() {
+        let db = Database::open_in_memory().expect("in-memory db");
+        let session = db.create_session(Some("Local URIs")).expect("session");
+        let attachments = serde_json::json!([
+            {
+                "media_type": "image/png",
+                "filename": "drive.png",
+                "uri": r"C:\files\drive.png",
+                "size": 1,
+                "sha256": ATTACHMENT_SHA256.to_ascii_uppercase(),
+            },
+            {
+                "media_type": "image/png",
+                "filename": "unc.png",
+                "uri": r"\\server\share\unc.png",
+                "size": 2,
+                "sha256": ATTACHMENT_SHA256,
+            },
+            {
+                "media_type": "application/x-custom-local-file",
+                "filename": "uri.pdf",
+                "uri": "file:///C:/files/uri.pdf",
+                "size": 3,
+                "sha256": ATTACHMENT_SHA256,
+            }
+        ])
+        .to_string();
+
+        let message = db
+            .append_message_with_attachments(&session.id, "user", "local files", Some(&attachments))
+            .expect("supported local URIs");
+        assert_eq!(
+            message.attachments_json.as_deref(),
+            Some(attachments.as_str())
+        );
+    }
+
+    #[test]
+    fn invalid_attachment_metadata_is_rejected_without_database_writes() {
+        let db = Database::open_in_memory().expect("in-memory db");
+        let session = db
+            .create_session(Some("Invalid attachments"))
+            .expect("session");
+        let valid = serde_json::json!({
+            "media_type": "application/pdf",
+            "filename": "report.pdf",
+            "uri": r"C:\files\report.pdf",
+            "size": 42,
+            "sha256": ATTACHMENT_SHA256,
+        });
+        let mut unknown_field = valid.clone();
+        unknown_field
+            .as_object_mut()
+            .expect("attachment object")
+            .insert("extra".to_string(), serde_json::json!(true));
+        let mut missing_field = valid.clone();
+        missing_field
+            .as_object_mut()
+            .expect("attachment object")
+            .remove("filename");
+        let mut invalid_sha = valid.clone();
+        invalid_sha["sha256"] = serde_json::json!("not-a-sha256");
+        let mut negative_size = valid.clone();
+        negative_size["size"] = serde_json::json!(-1);
+        let mut fractional_size = valid.clone();
+        fractional_size["size"] = serde_json::json!(1.5);
+        let mut relative_path = valid.clone();
+        relative_path["uri"] = serde_json::json!(r"files\report.pdf");
+        let mut data_uri = valid.clone();
+        data_uri["uri"] = serde_json::json!("data:image/png;base64,AAAA");
+        let mut raw_base64 = valid.clone();
+        raw_base64["uri"] = serde_json::json!("iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB");
+        let mut signed_http_url = valid.clone();
+        signed_http_url["uri"] = serde_json::json!(
+            "https://example.test/report.pdf?X-Amz-Credential=secret&X-Amz-Signature=deadbeef"
+        );
+        let mut plain_http_url = valid.clone();
+        plain_http_url["uri"] = serde_json::json!("http://example.test/report.pdf");
+        let mut file_access_token = valid.clone();
+        file_access_token["uri"] =
+            serde_json::json!("file:///C:/files/report.pdf?access_token=secret");
+        let mut file_userinfo = valid.clone();
+        file_userinfo["uri"] = serde_json::json!("file://user:password@server/share/report.pdf");
+        let mut file_fragment = valid.clone();
+        file_fragment["uri"] = serde_json::json!("file:///C:/files/report.pdf#secret");
+        let mut other_scheme = valid.clone();
+        other_scheme["uri"] = serde_json::json!("ftp://example.test/report.pdf");
+
+        let oversized = serde_json::json!([{
+            "media_type": "application/pdf",
+            "filename": "界".repeat(22_000),
+            "uri": r"C:\files\report.pdf",
+            "size": 42,
+            "sha256": ATTACHMENT_SHA256,
+        }])
+        .to_string();
+        assert!(oversized.len() > 64 * 1024);
+
+        let invalid_cases = [
+            ("empty string", String::new()),
+            ("malformed JSON", "[".to_string()),
+            ("non-array root", valid.to_string()),
+            ("non-object item", serde_json::json!(["bad"]).to_string()),
+            (
+                "unknown field",
+                serde_json::json!([unknown_field]).to_string(),
+            ),
+            (
+                "missing field",
+                serde_json::json!([missing_field]).to_string(),
+            ),
+            (
+                "invalid SHA-256",
+                serde_json::json!([invalid_sha]).to_string(),
+            ),
+            (
+                "negative size",
+                serde_json::json!([negative_size]).to_string(),
+            ),
+            (
+                "fractional size",
+                serde_json::json!([fractional_size]).to_string(),
+            ),
+            (
+                "relative path",
+                serde_json::json!([relative_path]).to_string(),
+            ),
+            ("data URI", serde_json::json!([data_uri]).to_string()),
+            ("raw Base64", serde_json::json!([raw_base64]).to_string()),
+            (
+                "signed HTTP URL",
+                serde_json::json!([signed_http_url]).to_string(),
+            ),
+            (
+                "plain HTTP URL",
+                serde_json::json!([plain_http_url]).to_string(),
+            ),
+            (
+                "file URI access token",
+                serde_json::json!([file_access_token]).to_string(),
+            ),
+            (
+                "file URI userinfo",
+                serde_json::json!([file_userinfo]).to_string(),
+            ),
+            (
+                "file URI fragment",
+                serde_json::json!([file_fragment]).to_string(),
+            ),
+            (
+                "other URI scheme",
+                serde_json::json!([other_scheme]).to_string(),
+            ),
+            ("oversized JSON", oversized),
+        ];
+
+        for (label, attachments) in invalid_cases {
+            assert!(
+                db.append_message_with_attachments(&session.id, "user", label, Some(&attachments))
+                    .is_err(),
+                "{label} should be rejected"
+            );
+            assert_eq!(
+                db.get_messages(&session.id, 100, 0)
+                    .expect("read messages")
+                    .len(),
+                0,
+                "{label} must not insert a message"
+            );
+            assert_eq!(
+                db.get_session(&session.id)
+                    .expect("read session")
+                    .expect("session exists")
+                    .message_count,
+                0,
+                "{label} must not increment message_count"
+            );
+        }
+    }
 
     #[test]
     fn session_artifacts_roundtrip_by_session() {
