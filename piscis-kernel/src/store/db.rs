@@ -506,6 +506,14 @@ pub struct ChatMessage {
     pub attachments_json: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentTurnMessage {
+    pub role: String,
+    pub content: String,
+    pub tool_calls_json: Option<String>,
+    pub tool_results_json: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionArtifact {
     pub id: String,
@@ -2055,6 +2063,60 @@ impl Database {
             turn_index,
             None,
         )
+    }
+
+    /// Persist every logical row of one completed agent turn and update the
+    /// session message count in a single SQLite transaction.
+    pub fn append_agent_turn_atomic(
+        &self,
+        session_id: &str,
+        turn_index: i64,
+        messages: &[AgentTurnMessage],
+    ) -> Result<Vec<ChatMessage>> {
+        if messages.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let now = Utc::now();
+        let now_str = now.to_rfc3339();
+        let inserted = messages
+            .iter()
+            .map(|message| ChatMessage {
+                id: Uuid::new_v4().to_string(),
+                session_id: session_id.to_string(),
+                role: message.role.clone(),
+                content: message.content.clone(),
+                created_at: now,
+                tool_calls_json: message.tool_calls_json.clone(),
+                tool_results_json: message.tool_results_json.clone(),
+                turn_index: Some(turn_index),
+                attachments_json: None,
+            })
+            .collect::<Vec<_>>();
+
+        let tx = self.conn.unchecked_transaction()?;
+        for message in &inserted {
+            tx.execute(
+                "INSERT INTO messages (id, session_id, role, content, created_at, tool_calls_json, tool_results_json, turn_index, attachments_json) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL)",
+                params![
+                    message.id,
+                    message.session_id,
+                    message.role,
+                    message.content,
+                    now_str,
+                    message.tool_calls_json,
+                    message.tool_results_json,
+                    turn_index,
+                ],
+            )?;
+        }
+        tx.execute(
+            "UPDATE sessions SET message_count = message_count + ?1, updated_at = ?2 WHERE id = ?3",
+            params![inserted.len() as i64, now_str, session_id],
+        )?;
+        tx.commit()?;
+        Ok(inserted)
     }
 
     /// Persist a message with optional tool metadata, turn index, and attachments.
@@ -5362,7 +5424,8 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_disallowed_koi_name_char, normalize_koi_name, Database, ImSessionBindingUpsert,
+        is_disallowed_koi_name_char, normalize_koi_name, AgentTurnMessage, Database,
+        ImSessionBindingUpsert,
     };
 
     const ATTACHMENT_SHA256: &str =
@@ -5522,7 +5585,9 @@ mod tests {
     #[test]
     fn attachment_append_rolls_back_insert_when_session_update_fails() {
         let db = Database::open_in_memory().expect("in-memory db");
-        let session = db.create_session(Some("Atomic attachment append")).expect("session");
+        let session = db
+            .create_session(Some("Atomic attachment append"))
+            .expect("session");
         db.conn
             .execute_batch(
                 "CREATE TRIGGER fail_attachment_session_update \
@@ -5542,6 +5607,98 @@ mod tests {
         assert!(db
             .get_messages(&session.id, 10, 0)
             .expect("read messages after failure")
+            .is_empty());
+        assert_eq!(
+            db.get_session(&session.id)
+                .expect("read session")
+                .expect("session exists")
+                .message_count,
+            0
+        );
+    }
+
+    #[test]
+    fn agent_turn_batch_preserves_tool_metadata_and_message_count() {
+        let db = Database::open_in_memory().expect("in-memory db");
+        let session = db
+            .create_session(Some("Atomic agent turn"))
+            .expect("session");
+        let messages = vec![
+            AgentTurnMessage {
+                role: "assistant".to_string(),
+                content: String::new(),
+                tool_calls_json: Some(r#"[{"type":"tool_use","id":"tool-1"}]"#.to_string()),
+                tool_results_json: None,
+            },
+            AgentTurnMessage {
+                role: "user".to_string(),
+                content: String::new(),
+                tool_calls_json: None,
+                tool_results_json: Some(
+                    r#"[{"type":"tool_result","tool_use_id":"tool-1"}]"#.to_string(),
+                ),
+            },
+            AgentTurnMessage {
+                role: "assistant".to_string(),
+                content: "delivered".to_string(),
+                tool_calls_json: None,
+                tool_results_json: None,
+            },
+        ];
+
+        let inserted = db
+            .append_agent_turn_atomic(&session.id, 7, &messages)
+            .expect("append atomic turn");
+
+        assert_eq!(inserted.len(), 3);
+        assert!(inserted.iter().all(|message| message.turn_index == Some(7)));
+        assert!(inserted[0].tool_calls_json.is_some());
+        assert!(inserted[1].tool_results_json.is_some());
+        assert_eq!(inserted[2].content, "delivered");
+        assert_eq!(
+            db.get_session(&session.id)
+                .expect("read session")
+                .expect("session exists")
+                .message_count,
+            3
+        );
+    }
+
+    #[test]
+    fn agent_turn_batch_rolls_back_every_row_when_later_insert_fails() {
+        let db = Database::open_in_memory().expect("in-memory db");
+        let session = db
+            .create_session(Some("Atomic agent turn failure"))
+            .expect("session");
+        db.conn
+            .execute_batch(
+                "CREATE TRIGGER fail_agent_turn_row \
+                 BEFORE INSERT ON messages \
+                 WHEN NEW.content = 'injected-failure' \
+                 BEGIN SELECT RAISE(FAIL, 'injected agent turn failure'); END;",
+            )
+            .expect("install failure trigger");
+        let messages = vec![
+            AgentTurnMessage {
+                role: "assistant".to_string(),
+                content: "first row must roll back".to_string(),
+                tool_calls_json: Some(r#"[{"type":"tool_use","id":"tool-1"}]"#.to_string()),
+                tool_results_json: None,
+            },
+            AgentTurnMessage {
+                role: "assistant".to_string(),
+                content: "injected-failure".to_string(),
+                tool_calls_json: None,
+                tool_results_json: None,
+            },
+        ];
+
+        assert!(db
+            .append_agent_turn_atomic(&session.id, 9, &messages)
+            .is_err());
+        assert!(db
+            .get_messages(&session.id, 10, 0)
+            .expect("messages after rollback")
             .is_empty());
         assert_eq!(
             db.get_session(&session.id)
