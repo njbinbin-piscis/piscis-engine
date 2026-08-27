@@ -2076,16 +2076,18 @@ impl Database {
         let id = Uuid::new_v4().to_string();
         let now = Utc::now();
         let now_str = now.to_rfc3339();
-        self.conn.execute(
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
             "INSERT INTO messages (id, session_id, role, content, created_at, tool_calls_json, tool_results_json, turn_index, attachments_json) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![id, session_id, role, content, now_str, tool_calls_json, tool_results_json, turn_index, attachments_json],
         )?;
         // Update session message count and updated_at
-        self.conn.execute(
+        tx.execute(
             "UPDATE sessions SET message_count = message_count + 1, updated_at = ?1 WHERE id = ?2",
             params![now_str, session_id],
         )?;
+        tx.commit()?;
         Ok(ChatMessage {
             id,
             session_id: session_id.to_string(),
@@ -5515,6 +5517,39 @@ mod tests {
         );
         assert_eq!(existing_full.turn_index, Some(8));
         assert!(existing_full.attachments_json.is_none());
+    }
+
+    #[test]
+    fn attachment_append_rolls_back_insert_when_session_update_fails() {
+        let db = Database::open_in_memory().expect("in-memory db");
+        let session = db.create_session(Some("Atomic attachment append")).expect("session");
+        db.conn
+            .execute_batch(
+                "CREATE TRIGGER fail_attachment_session_update \
+                 BEFORE UPDATE OF message_count ON sessions \
+                 BEGIN SELECT RAISE(FAIL, 'injected session update failure'); END;",
+            )
+            .expect("install failure trigger");
+
+        assert!(db
+            .append_message_with_attachments(
+                &session.id,
+                "user",
+                "must not survive a failed session update",
+                Some(&attachment_json(r"C:\files\atomic.pdf", "atomic.pdf")),
+            )
+            .is_err());
+        assert!(db
+            .get_messages(&session.id, 10, 0)
+            .expect("read messages after failure")
+            .is_empty());
+        assert_eq!(
+            db.get_session(&session.id)
+                .expect("read session")
+                .expect("session exists")
+                .message_count,
+            0
+        );
     }
 
     #[test]
