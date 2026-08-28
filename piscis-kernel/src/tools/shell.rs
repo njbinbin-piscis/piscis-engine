@@ -206,7 +206,8 @@ impl Tool for ShellTool {
                 };
                 let elev_timeout = input["timeout"].as_u64().unwrap_or(180);
                 return render_elevated_result(
-                    elevate::run_elevated_powershell(command, arch, elev_timeout).await,
+                    elevate::run_elevated_powershell(command, arch, &cwd, &env_pairs, elev_timeout)
+                        .await,
                     "Administrator",
                 );
             }
@@ -271,6 +272,8 @@ impl Tool for ShellTool {
                         elevate::run_elevated_powershell(
                             command,
                             arch,
+                            &cwd,
+                            &env_pairs,
                             input["timeout"].as_u64().unwrap_or(180),
                         )
                         .await
