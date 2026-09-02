@@ -8,7 +8,9 @@
 use anyhow::Result;
 use std::path::PathBuf;
 use std::time::Duration;
-use tokio::time::{sleep, timeout};
+#[cfg(target_os = "windows")]
+use tokio::time::sleep;
+use tokio::time::timeout;
 
 #[cfg(target_os = "linux")]
 use crate::proc::std_command;
@@ -367,6 +369,7 @@ pub async fn run_elevated_shell(
     ))
 }
 
+#[cfg(target_os = "windows")]
 async fn poll_for_result(result_path: &PathBuf) -> Result<String> {
     // Poll every 500ms until the result file appears
     loop {
@@ -506,6 +509,7 @@ fn command_exists(cmd: &str) -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(target_os = "windows")]
 fn parse_result(json_str: &str) -> Result<ElevatedResult> {
     // Strip UTF-8 BOM (U+FEFF) that Windows WriteAllText with UTF8 encoding emits,
     // then also strip whitespace. serde_json rejects any leading non-JSON bytes.

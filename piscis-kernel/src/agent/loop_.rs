@@ -4780,6 +4780,7 @@ mod tests {
             context_manager: None,
             memory_retrieval_prompt: None,
             loop_strategy: None,
+            same_model_transient_retries: 3,
         }
     }
 
