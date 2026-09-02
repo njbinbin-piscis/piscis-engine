@@ -1,3 +1,4 @@
+pub mod auto_select;
 pub mod claude;
 pub mod deepseek;
 pub mod error_class;

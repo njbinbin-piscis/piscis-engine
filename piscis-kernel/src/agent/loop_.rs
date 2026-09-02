@@ -31,7 +31,6 @@ use tracing::{debug, info, warn};
 
 const DEFAULT_MAX_ITERATIONS: usize = 50;
 const TOOL_TIMEOUT_SECS: u64 = 120;
-const LLM_MAX_RETRIES: u32 = 3;
 const READ_TOOL_MAX_CONCURRENCY: usize = 4;
 
 // ── Runtime guard thresholds ─────────────────────────────────────────────────
@@ -1999,6 +1998,10 @@ pub struct AgentLoop {
     /// Optional pluggable loop-control strategy (context transform, stop, and
     /// next-turn hooks). `None` uses the kernel's built-in ReAct control flow.
     pub loop_strategy: Option<Arc<dyn crate::agent::loop_strategy::LoopStrategy>>,
+    /// Same-model transient retries (timeout / 502 / 503). DimRouter already
+    /// fails over to another supplier of this id, so cloud-gateway hosts set
+    /// this to 1. Direct official APIs keep the default of 3.
+    pub same_model_transient_retries: u32,
 }
 
 impl AgentLoop {
@@ -3166,7 +3169,8 @@ impl AgentLoop {
                     .with_vision_override(self.vision_override)
                     .build_for(provider_kind);
 
-                    for attempt in 0..LLM_MAX_RETRIES {
+                    let same_model_attempts = self.same_model_transient_retries.max(1);
+                    for attempt in 0..same_model_attempts {
                         // Check cancel before each LLM attempt
                         if cancel.load(Ordering::Relaxed) {
                             break 'model_loop;
@@ -3229,11 +3233,11 @@ impl AgentLoop {
                                 warn!(
                                     model = %model_candidate,
                                     attempt = attempt + 1,
-                                    max_attempts = LLM_MAX_RETRIES,
+                                    max_attempts = same_model_attempts,
                                     error_code = attempt_error_code,
                                     "LLM call attempt {}/{} model={} failed: {}",
                                     attempt + 1,
-                                    LLM_MAX_RETRIES,
+                                    same_model_attempts,
                                     model_candidate,
                                     msg
                                 );
@@ -3366,7 +3370,7 @@ impl AgentLoop {
                                         || msg.contains("incomplete message")
                                         || msg.contains("unexpected eof")
                                         || msg.contains("broken pipe");
-                                    if !is_transient || attempt + 1 == LLM_MAX_RETRIES {
+                                    if !is_transient || attempt + 1 == same_model_attempts {
                                         last_err = Some(e);
                                         break 'model_loop;
                                     }
@@ -4508,6 +4512,7 @@ mod tests {
             context_manager: None,
             memory_retrieval_prompt: None,
             loop_strategy: None,
+            same_model_transient_retries: 3,
         };
         let (event_tx, _event_rx) = tokio::sync::mpsc::channel(16);
         let ctx = ToolContext {
@@ -4603,6 +4608,7 @@ mod tests {
             context_manager: None,
             memory_retrieval_prompt: None,
             loop_strategy: None,
+            same_model_transient_retries: 3,
         };
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(32);
         let ctx = ToolContext {
@@ -4719,6 +4725,7 @@ mod tests {
             context_manager: None,
             memory_retrieval_prompt: None,
             loop_strategy: None,
+            same_model_transient_retries: 3,
         };
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(32);
         let ctx = ToolContext {

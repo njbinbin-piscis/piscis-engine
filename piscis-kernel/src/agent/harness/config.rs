@@ -226,6 +226,8 @@ pub struct HarnessConfig {
     /// Optional pluggable loop-control strategy. `None` uses the kernel's
     /// built-in ReAct control flow.
     pub loop_strategy: Option<Arc<dyn crate::agent::loop_strategy::LoopStrategy>>,
+    /// Same-model transient retries. Cloud DimRouter hosts set this to 1.
+    pub same_model_transient_retries: u32,
 }
 
 impl HarnessConfig {
@@ -470,6 +472,13 @@ impl HarnessConfig {
         self
     }
 
+    /// DimRouter already failovers the same catalogue id across suppliers;
+    /// cloud-gateway hosts pass 1. Direct official APIs keep the default of 3.
+    pub fn with_same_model_transient_retries(mut self, retries: u32) -> Self {
+        self.same_model_transient_retries = retries.max(1);
+        self
+    }
+
     /// Post-construction setter for the compaction policy (see `with_hooks`).
     pub fn with_compaction_strategy(
         mut self,
@@ -521,6 +530,7 @@ impl HarnessConfig {
             context_manager: self.context_manager,
             memory_retrieval_prompt: self.memory_retrieval_prompt,
             loop_strategy: self.loop_strategy,
+            same_model_transient_retries: self.same_model_transient_retries.max(1),
         }
     }
 }
@@ -567,6 +577,7 @@ impl HarnessConfigBuilder {
             memory_plugin: None,
             memory_retrieval_prompt: None,
             loop_strategy: None,
+            same_model_transient_retries: 3,
         };
         Self { inner }
     }
@@ -622,6 +633,12 @@ impl HarnessConfigBuilder {
 
     pub fn with_fallback_models(mut self, models: Vec<String>) -> Self {
         self.inner.fallback_models = models;
+        self
+    }
+
+    /// DimRouter already failovers the same model across suppliers; pass 1.
+    pub fn with_same_model_transient_retries(mut self, retries: u32) -> Self {
+        self.inner.same_model_transient_retries = retries.max(1);
         self
     }
 
