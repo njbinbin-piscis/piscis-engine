@@ -81,13 +81,7 @@ impl LayeredBudget {
     /// Override the three tier percentages. Panics in debug / clamps in
     /// release if the ordering `micro < auto < full <= 100` is violated.
     pub fn with_tier_percents(mut self, micro: u8, auto: u8, full: u8) -> Self {
-        debug_assert!(
-            micro < auto && auto < full && full <= 100,
-            "tier percents must satisfy micro < auto < full <= 100 (got {micro}/{auto}/{full})"
-        );
-        let micro = micro.min(99);
-        let auto = auto.clamp(micro + 1, 99);
-        let full = full.clamp(auto + 1, 100);
+        let (micro, auto, full) = normalize_tier_percents(micro, auto, full);
         self.trigger_micro = percent_of(self.total, micro);
         self.trigger_auto = percent_of(self.total, auto);
         self.trigger_full = percent_of(self.total, full);
@@ -96,7 +90,7 @@ impl LayeredBudget {
 
     /// Override the single-tool-result hard cap.
     pub fn with_max_tool_result_tokens(mut self, v: u32) -> Self {
-        self.max_tool_result_tokens = v.clamp(1_000, 64_000);
+        self.max_tool_result_tokens = if v == 0 { 0 } else { v.clamp(1_000, 64_000) };
         self
     }
 
@@ -120,6 +114,17 @@ impl Default for LayeredBudget {
     }
 }
 
+pub(crate) fn normalize_tier_percents(micro: u8, auto: u8, full: u8) -> (u8, u8, u8) {
+    debug_assert!(
+        micro < auto && auto < full && full <= 100,
+        "tier percents must satisfy micro < auto < full <= 100 (got {micro}/{auto}/{full})"
+    );
+    let micro = micro.min(99);
+    let auto = auto.clamp(micro + 1, 99);
+    let full = full.clamp(auto + 1, 100);
+    (micro, auto, full)
+}
+
 fn percent_of(total: u32, pct: u8) -> u32 {
     ((total as u64) * pct as u64 / 100) as u32
 }
@@ -141,10 +146,16 @@ mod tests {
     #[test]
     fn budget_classifies_tiers_monotonically() {
         let b = LayeredBudget::with_total(100_000);
+        assert_eq!(
+            (b.trigger_micro, b.trigger_auto, b.trigger_full),
+            (60_000, 80_000, 95_000)
+        );
         assert_eq!(b.classify(0), CompactionTier::None);
         assert_eq!(b.classify(b.trigger_micro - 1), CompactionTier::None);
         assert_eq!(b.classify(b.trigger_micro), CompactionTier::Micro);
+        assert_eq!(b.classify(79_999), CompactionTier::Micro);
         assert_eq!(b.classify(b.trigger_auto), CompactionTier::Auto);
+        assert_eq!(b.classify(94_999), CompactionTier::Auto);
         assert_eq!(b.classify(b.trigger_full), CompactionTier::Full);
         assert_eq!(b.classify(b.total + 10), CompactionTier::Full);
     }
@@ -172,9 +183,24 @@ mod tests {
 
     #[test]
     fn budget_max_tool_result_tokens_clamp() {
+        let b = LayeredBudget::with_total(100_000).with_max_tool_result_tokens(0);
+        assert_eq!(b.max_tool_result_tokens, 0, "zero disables the cap");
         let b = LayeredBudget::with_total(100_000).with_max_tool_result_tokens(500);
         assert_eq!(b.max_tool_result_tokens, 1_000);
         let b = LayeredBudget::with_total(100_000).with_max_tool_result_tokens(200_000);
         assert_eq!(b.max_tool_result_tokens, 64_000);
+    }
+
+    #[test]
+    fn public_layered_budget_keeps_struct_literal_compatibility() {
+        let budget = LayeredBudget {
+            total: 100_000,
+            trigger_micro: 60_000,
+            trigger_auto: 80_000,
+            trigger_full: 95_000,
+            max_tool_result_tokens: 8_000,
+        };
+
+        assert_eq!(budget.classify(79_999), CompactionTier::Micro);
     }
 }

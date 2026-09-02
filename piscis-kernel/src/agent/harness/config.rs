@@ -511,6 +511,7 @@ impl HarnessConfig {
             model: self.model,
             max_tokens: self.max_tokens,
             context_window: self.context_window,
+            budget: self.budget,
             fallback_models: self.fallback_models,
             db: self.persistence,
             plan_state: self.plan_state,
@@ -538,6 +539,7 @@ impl HarnessConfig {
 /// Builder. All `with_*` methods consume and return `self` for chaining.
 pub struct HarnessConfigBuilder {
     inner: HarnessConfig,
+    tier_percents: (u8, u8, u8),
 }
 
 impl HarnessConfigBuilder {
@@ -579,7 +581,14 @@ impl HarnessConfigBuilder {
             loop_strategy: None,
             same_model_transient_retries: 3,
         };
-        Self { inner }
+        Self {
+            inner,
+            tier_percents: (
+                super::budget::DEFAULT_TIER_MICRO_PERCENT,
+                super::budget::DEFAULT_TIER_AUTO_PERCENT,
+                super::budget::DEFAULT_TIER_FULL_PERCENT,
+            ),
+        }
     }
 
     /// Wire host lifecycle hooks into the loop.
@@ -700,7 +709,12 @@ impl HarnessConfigBuilder {
     }
 
     pub fn with_tier_percents(mut self, micro: u8, auto: u8, full: u8) -> Self {
-        self.inner.budget = self.inner.budget.with_tier_percents(micro, auto, full);
+        self.tier_percents = super::budget::normalize_tier_percents(micro, auto, full);
+        self.inner.budget = self.inner.budget.with_tier_percents(
+            self.tier_percents.0,
+            self.tier_percents.1,
+            self.tier_percents.2,
+        );
         self
     }
 
@@ -714,10 +728,16 @@ impl HarnessConfigBuilder {
     /// single call. Used by scene factories to keep their signatures
     /// narrow.
     pub fn with_compaction_settings(mut self, c: &CompactionSettings) -> Self {
+        self.tier_percents =
+            super::budget::normalize_tier_percents(c.micro_percent, c.auto_percent, c.full_percent);
         self.inner.budget = self
             .inner
             .budget
-            .with_tier_percents(c.micro_percent, c.auto_percent, c.full_percent)
+            .with_tier_percents(
+                self.tier_percents.0,
+                self.tier_percents.1,
+                self.tier_percents.2,
+            )
             .with_max_tool_result_tokens(c.max_tool_result_tokens);
         self.inner.summary_model = c.summary_model.clone().filter(|s| !s.trim().is_empty());
         self
@@ -758,28 +778,14 @@ impl HarnessConfigBuilder {
         // Re-derive caps from the current (context_window, max_tokens)
         // while preserving any previously-set tier percents / tool cap.
         let prev = self.inner.budget;
-        let new =
-            LayeredBudget::from_context_window(self.inner.context_window, self.inner.max_tokens);
-        // Preserve overrides if they diverged from defaults.
-        let micro_pct = pct_of(prev.trigger_micro, prev.total);
-        let auto_pct = pct_of(prev.trigger_auto, prev.total);
-        let full_pct = pct_of(prev.trigger_full, prev.total);
-        let mut new = new;
-        if prev.total > 0 && micro_pct > 0 && auto_pct > micro_pct && full_pct > auto_pct {
-            new = new.with_tier_percents(micro_pct, auto_pct, full_pct);
-        }
-        if prev.max_tool_result_tokens != super::budget::DEFAULT_MAX_TOOL_RESULT_TOKENS {
-            new = new.with_max_tool_result_tokens(prev.max_tool_result_tokens);
-        }
-        self.inner.budget = new;
-    }
-}
-
-fn pct_of(value: u32, total: u32) -> u8 {
-    if total == 0 {
-        0
-    } else {
-        ((value as u64 * 100 / total as u64).min(100)) as u8
+        self.inner.budget =
+            LayeredBudget::from_context_window(self.inner.context_window, self.inner.max_tokens)
+                .with_tier_percents(
+                    self.tier_percents.0,
+                    self.tier_percents.1,
+                    self.tier_percents.2,
+                )
+                .with_max_tool_result_tokens(prev.max_tool_result_tokens);
     }
 }
 
@@ -823,6 +829,127 @@ mod tests {
         // Tier ordering preserved.
         assert!(cfg.budget.trigger_micro < cfg.budget.trigger_auto);
         assert!(cfg.budget.trigger_auto < cfg.budget.trigger_full);
+    }
+
+    #[test]
+    fn builder_refreshes_exact_default_thresholds_for_context_and_max_output_changes() {
+        let build = |context_window, max_tokens| {
+            let (reg, policy) = scaffolding();
+            HarnessConfig::builder("main", "test-model", reg, policy)
+                .with_context_window(context_window)
+                .with_max_tokens(max_tokens)
+                .build()
+                .budget
+        };
+        let budget_32k = build(32_000, 4_096);
+        let budget_128k = build(128_000, 4_096);
+        let budget_128k_larger_output = build(128_000, 16_384);
+
+        for budget in [budget_32k, budget_128k, budget_128k_larger_output] {
+            assert_eq!(budget.trigger_micro, budget.total * 60 / 100);
+            assert_eq!(budget.trigger_auto, budget.total * 80 / 100);
+            assert_eq!(budget.trigger_full, budget.total * 95 / 100);
+        }
+        assert!(budget_128k.trigger_micro > budget_32k.trigger_micro);
+        assert!(budget_128k_larger_output.trigger_micro < budget_128k.trigger_micro);
+        assert!(budget_128k_larger_output.trigger_auto < budget_128k.trigger_auto);
+        assert!(budget_128k_larger_output.trigger_full < budget_128k.trigger_full);
+    }
+
+    #[test]
+    fn builder_refresh_preserves_custom_tiers_and_tool_cap() {
+        let (reg, policy) = scaffolding();
+        let config = HarnessConfig::builder("main", "test-model", reg, policy)
+            .with_context_window(32_000)
+            .with_tier_percents(55, 75, 92)
+            .with_max_tool_result_tokens(6_000)
+            .with_context_window(128_000)
+            .with_max_tokens(16_384)
+            .build();
+        let budget = config.budget;
+
+        assert_eq!(budget.trigger_micro, budget.total * 55 / 100);
+        assert_eq!(budget.trigger_auto, budget.total * 75 / 100);
+        assert_eq!(budget.trigger_full, budget.total * 92 / 100);
+        assert_eq!(budget.max_tool_result_tokens, 6_000);
+
+        let agent = config.into_agent_loop(
+            crate::llm::build_client("openai", "test-key", None),
+            None,
+            None,
+        );
+        assert_eq!(agent.budget.total, budget.total);
+        assert_eq!(agent.budget.trigger_micro, budget.trigger_micro);
+        assert_eq!(agent.budget.trigger_auto, budget.trigger_auto);
+        assert_eq!(agent.budget.trigger_full, budget.trigger_full);
+        assert_eq!(
+            agent.budget.max_tool_result_tokens,
+            budget.max_tool_result_tokens
+        );
+    }
+
+    #[test]
+    fn builder_refresh_preserves_compaction_settings_percents() {
+        let (reg, policy) = scaffolding();
+        let settings = CompactionSettings {
+            micro_percent: 55,
+            auto_percent: 75,
+            full_percent: 92,
+            max_tool_result_tokens: 6_000,
+            summary_model: None,
+        };
+        let budget = HarnessConfig::builder("main", "test-model", reg, policy)
+            .with_compaction_settings(&settings)
+            .with_context_window(3)
+            .with_max_tokens(1)
+            .with_context_window(128_000)
+            .with_max_tokens(16_384)
+            .build()
+            .budget;
+
+        assert_eq!(budget.trigger_micro, budget.total * 55 / 100);
+        assert_eq!(budget.trigger_auto, budget.total * 75 / 100);
+        assert_eq!(budget.trigger_full, budget.total * 92 / 100);
+        assert_eq!(budget.max_tool_result_tokens, 6_000);
+    }
+
+    #[test]
+    fn builder_refresh_preserves_custom_percents_through_101_and_tiny_totals() {
+        let (reg, policy) = scaffolding();
+        let budget = HarnessConfig::builder("main", "test-model", reg, policy)
+            .with_context_window(120)
+            .with_max_tokens(1)
+            .with_tier_percents(55, 75, 92)
+            .with_context_window(3)
+            .with_max_tokens(1)
+            .with_context_window(32_000)
+            .with_max_tokens(4_096)
+            .with_context_window(128_000)
+            .with_max_tokens(16_384)
+            .build()
+            .budget;
+
+        assert_eq!(budget.trigger_micro, budget.total * 55 / 100);
+        assert_eq!(budget.trigger_auto, budget.total * 75 / 100);
+        assert_eq!(budget.trigger_full, budget.total * 92 / 100);
+    }
+
+    #[test]
+    fn builder_refresh_preserves_default_percents_through_101_and_tiny_totals() {
+        let (reg, policy) = scaffolding();
+        let budget = HarnessConfig::builder("main", "test-model", reg, policy)
+            .with_context_window(120)
+            .with_max_tokens(1)
+            .with_context_window(3)
+            .with_max_tokens(1)
+            .with_context_window(128_000)
+            .with_max_tokens(16_384)
+            .build()
+            .budget;
+
+        assert_eq!(budget.trigger_micro, budget.total * 60 / 100);
+        assert_eq!(budget.trigger_auto, budget.total * 80 / 100);
+        assert_eq!(budget.trigger_full, budget.total * 95 / 100);
     }
 
     #[test]

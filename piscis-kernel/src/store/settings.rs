@@ -212,6 +212,14 @@ fn default_archive_after_days() -> u32 {
     90
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ModelRuntimeProfile {
+    pub context_window: u32,
+    pub max_output_tokens: u32,
+    #[serde(default)]
+    pub supported_endpoint_types: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
     /// Anthropic API key
@@ -267,6 +275,9 @@ pub struct Settings {
     /// Format: "provider/model" e.g. ["anthropic/claude-haiku-3-5", "openai/gpt-4o-mini"]
     #[serde(default)]
     pub fallback_models: Vec<String>,
+    /// Runtime capabilities discovered for each provider/model identifier.
+    #[serde(default)]
+    pub model_runtime_profiles: HashMap<String, ModelRuntimeProfile>,
     /// Whether to show permission dialogs for shell commands
     #[serde(default = "default_true")]
     pub confirm_shell_commands: bool,
@@ -758,6 +769,7 @@ impl Default for Settings {
             max_tokens: default_max_tokens(),
             context_window: 0,
             fallback_models: vec![],
+            model_runtime_profiles: HashMap::new(),
             confirm_shell_commands: true,
             confirm_file_writes: true,
             browser_headless: true,
@@ -1016,5 +1028,39 @@ impl Settings {
             .unwrap_or_else(|| PathBuf::from("."))
             .join("com.piscis.desktop")
             .join("config.json")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_settings_json_defaults_model_runtime_profiles_to_empty() {
+        let settings: Settings = serde_json::from_str("{}").expect("legacy settings JSON");
+        assert!(settings.model_runtime_profiles.is_empty());
+    }
+
+    #[test]
+    fn model_runtime_profiles_roundtrip_without_losing_capabilities() {
+        let mut settings = Settings::default();
+        settings.model_runtime_profiles.insert(
+            "provider/model".into(),
+            ModelRuntimeProfile {
+                context_window: 128_000,
+                max_output_tokens: 16_384,
+                supported_endpoint_types: vec!["chat".into(), "image".into()],
+            },
+        );
+
+        let encoded = serde_json::to_string(&settings).expect("serialize settings");
+        let decoded: Settings = serde_json::from_str(&encoded).expect("deserialize settings");
+        let profile = decoded
+            .model_runtime_profiles
+            .get("provider/model")
+            .expect("runtime profile");
+        assert_eq!(profile.context_window, 128_000);
+        assert_eq!(profile.max_output_tokens, 16_384);
+        assert_eq!(profile.supported_endpoint_types, ["chat", "image"]);
     }
 }

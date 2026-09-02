@@ -21,6 +21,7 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 
+use crate::agent::harness::LayeredBudget;
 use crate::llm::{LlmClient, LlmMessage, ToolDef};
 
 /// Why the loop is asking the strategy to compact. Lets one `compact()` entry
@@ -43,6 +44,8 @@ pub enum CompactionTrigger {
 pub struct CompactionRequest<'a> {
     /// Why compaction is being requested (proactive vs overflow recovery).
     pub trigger: CompactionTrigger,
+    /// Model-derived safe input budget and compaction tier thresholds.
+    pub budget: LayeredBudget,
     /// Full in-memory conversation history (newest last).
     pub messages: Vec<LlmMessage>,
     /// Current rolling summary (empty when none yet).
