@@ -112,7 +112,13 @@ fn is_dashscope_qwen_endpoint(base_url: &str, model: &str) -> bool {
 
 fn is_deepseek_thinking_model(model: &str) -> bool {
     let model = model.to_lowercase();
-    model.contains("deepseek-v4") || model.contains("deepseek-reasoner")
+    // Also covers gateway-prefixed names (e.g. `deepseek-ai/DeepSeek-R1`) and
+    // `*-think*` variants, whose reasoning_content we cannot replay.
+    model.contains("deepseek")
+        && (model.contains("v4")
+            || model.contains("reasoner")
+            || model.contains("think")
+            || model.contains("-r1"))
 }
 
 /// Parse a single accumulated tool-call's `arguments` buffer into a chunk to
@@ -520,6 +526,12 @@ impl OpenAiClient {
         // Images from tool results that need to be appended as a separate user message
         // right after the tool messages (OpenAI format requires this).
         let mut pending_vision: Vec<Value> = Vec::new();
+        // tool_call ids emitted by an assistant message that still await a reply.
+        // Replaces the old "previous message must be the tool_calls one" check,
+        // which dropped the 2nd..Nth result of a parallel tool-call batch and made
+        // strict providers (DeepSeek) reject the request.
+        let mut pending_tool_ids: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
 
         for (idx, m) in messages.iter().enumerate() {
             if skip[idx] {
@@ -529,7 +541,12 @@ impl OpenAiClient {
 
             // Flush any pending vision images before starting a new non-tool message
             // (so they appear immediately after the last tool message).
-            if !pending_vision.is_empty() && m.role != "tool" {
+            let carries_tool_result = matches!(
+                &m.content,
+                MessageContent::Blocks(b) if b.iter().any(|x| matches!(x, ContentBlock::ToolResult { .. }))
+            );
+            // Do not split a batch of tool replies with the vision user message.
+            if !pending_vision.is_empty() && m.role != "tool" && !carries_tool_result {
                 tracing::debug!(
                     "convert_messages [{idx}] flushing {} pending_vision images before role={}",
                     pending_vision.len(),
@@ -558,18 +575,13 @@ impl OpenAiClient {
                     .iter()
                     .any(|b| matches!(b, ContentBlock::ToolResult { .. }));
                 if has_tool_result {
-                    let last_role = result
-                        .last()
-                        .and_then(|v| v["role"].as_str())
-                        .unwrap_or("none");
-                    let last_has_tool_calls = result
-                        .last()
-                        .and_then(|v| v["tool_calls"].as_array())
-                        .map(|a| !a.is_empty())
-                        .unwrap_or(false);
-                    if !last_has_tool_calls {
+                    let answers_pending = blocks.iter().any(|b| {
+                        matches!(b, ContentBlock::ToolResult { tool_use_id, .. }
+                            if pending_tool_ids.contains(tool_use_id))
+                    });
+                    if !answers_pending {
                         tracing::warn!(
-                            "convert_messages [{idx}] SKIP orphaned tool_result (last result role={last_role}, has_tool_calls={last_has_tool_calls})"
+                            "convert_messages [{idx}] SKIP orphaned tool_result (no pending tool_call id)"
                         );
                         continue;
                     }
@@ -598,6 +610,7 @@ impl OpenAiClient {
                                     content,
                                     ..
                                 } => {
+                                    pending_tool_ids.remove(tool_use_id);
                                     result.push(json!({
                                         "role": "tool",
                                         "tool_call_id": tool_use_id,
@@ -636,6 +649,7 @@ impl OpenAiClient {
                             match block {
                                 ContentBlock::Text { text } => text_content.push_str(text),
                                 ContentBlock::ToolUse { id, name, input } => {
+                                    pending_tool_ids.insert(id.clone());
                                     tool_calls.push(json!({
                                         "id": id,
                                         "type": "function",
@@ -1057,6 +1071,37 @@ impl LlmClient for OpenAiClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parallel_tool_results_in_separate_messages_are_all_kept() {
+        let client = OpenAiClient::new("k", "https://api.deepseek.com/v1");
+        let msg = |role: &str, blocks: Vec<ContentBlock>| LlmMessage {
+            role: role.to_string(),
+            content: MessageContent::Blocks(blocks),
+        };
+        let use_block = |id: &str| ContentBlock::ToolUse {
+            id: id.to_string(),
+            name: "shell".to_string(),
+            input: json!({}),
+        };
+        let result_block = |id: &str| ContentBlock::ToolResult {
+            tool_use_id: id.to_string(),
+            content: "ok".to_string(),
+            is_error: false,
+        };
+        let messages = vec![
+            msg("assistant", vec![use_block("a"), use_block("b")]),
+            msg("user", vec![result_block("a")]),
+            msg("user", vec![result_block("b")]),
+        ];
+        let out = client.convert_messages(&messages, false);
+        let tool_ids: Vec<&str> = out
+            .iter()
+            .filter(|v| v["role"] == "tool")
+            .filter_map(|v| v["tool_call_id"].as_str())
+            .collect();
+        assert_eq!(tool_ids, vec!["a", "b"]);
+    }
 
     fn request_for_model(model: &str) -> LlmRequest {
         LlmRequest {
