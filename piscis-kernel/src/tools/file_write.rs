@@ -59,6 +59,16 @@ fn write_with_bom_policy(
 
 pub struct FileWriteTool;
 
+/// Convert every line ending in `s` to CRLF (`crlf == true`) or LF.
+fn adapt_eol(s: &str, crlf: bool) -> String {
+    let lf = s.replace("\r\n", "\n");
+    if crlf {
+        lf.replace('\n', "\r\n")
+    } else {
+        lf
+    }
+}
+
 #[async_trait]
 impl Tool for FileWriteTool {
     fn name(&self) -> &str {
@@ -379,7 +389,7 @@ impl Tool for FileEditTool {
         }
 
         // Build the list of (old, new) pairs from either mode
-        let pairs: Vec<(String, String)> = if let Some(edits_arr) = input["edits"].as_array() {
+        let mut pairs: Vec<(String, String)> = if let Some(edits_arr) = input["edits"].as_array() {
             if edits_arr.is_empty() {
                 return Ok(ToolResult::err("edits array is empty"));
             }
@@ -426,6 +436,22 @@ impl Tool for FileEditTool {
         let preserve_bom = raw.starts_with(UTF8_BOM);
         let (content, encoding) = decode_bytes(&raw);
         let lines_before = content.lines().count();
+
+        // Line-ending tolerance: model-supplied snippets are usually LF, while the
+        // file on disk may be CRLF (or vice versa). If the snippet does not match
+        // verbatim, retry with its line endings converted to the file's style, and
+        // convert `new` the same way so the file keeps a consistent EOL.
+        let file_is_crlf = content.contains("\r\n");
+        for (old, new) in pairs.iter_mut() {
+            if content.contains(old.as_str()) {
+                continue;
+            }
+            let adapted_old = adapt_eol(old, file_is_crlf);
+            if adapted_old != *old && content.contains(adapted_old.as_str()) {
+                *new = adapt_eol(new, file_is_crlf);
+                *old = adapted_old;
+            }
+        }
 
         for (i, (old, _)) in pairs.iter().enumerate() {
             let count = content.matches(old.as_str()).count();
@@ -514,5 +540,21 @@ impl Tool for FileEditTool {
                 encoding
             )))
         }
+    }
+}
+
+#[cfg(test)]
+mod eol_tests {
+    use super::adapt_eol;
+
+    #[test]
+    fn lf_snippet_becomes_crlf_for_crlf_file() {
+        assert_eq!(adapt_eol("a\nb", true), "a\r\nb");
+        assert_eq!(adapt_eol("a\r\nb", true), "a\r\nb");
+    }
+
+    #[test]
+    fn crlf_snippet_becomes_lf_for_lf_file() {
+        assert_eq!(adapt_eol("a\r\nb", false), "a\nb");
     }
 }
