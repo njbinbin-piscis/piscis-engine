@@ -110,6 +110,9 @@ pub struct PolicyGate {
     pub tool_rate_limit_per_minute: u32,
     /// When true, paths outside workspace_root produce a Warn instead of Deny.
     pub allow_outside_workspace: bool,
+    /// Extra directories whose files may be accessed without "allow outside
+    /// workspace" (e.g. dependency sources for read-only research agents).
+    pub extra_read_roots: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -148,6 +151,7 @@ impl PolicyGate {
             mode: PolicyMode::Balanced,
             tool_rate_limit_per_minute: 120,
             allow_outside_workspace: false,
+            extra_read_roots: Vec::new(),
         }
     }
 
@@ -161,6 +165,7 @@ impl PolicyGate {
             mode: PolicyMode::parse(mode),
             tool_rate_limit_per_minute,
             allow_outside_workspace: false,
+            extra_read_roots: Vec::new(),
         }
     }
 
@@ -175,7 +180,18 @@ impl PolicyGate {
             mode: PolicyMode::parse(mode),
             tool_rate_limit_per_minute,
             allow_outside_workspace,
+            extra_read_roots: Vec::new(),
         }
+    }
+
+    /// Allow access under `roots`. Only hand this to agents whose tool surface is
+    /// read-only; the gate itself does not distinguish reads from writes.
+    pub fn with_extra_read_roots(mut self, roots: Vec<PathBuf>) -> Self {
+        self.extra_read_roots = roots
+            .into_iter()
+            .map(|r| Self::normalize_path_for_compare(r.canonicalize().unwrap_or(r)))
+            .collect();
+        self
     }
 
     /// Check a file path — must be within workspace_root
@@ -206,7 +222,7 @@ impl PolicyGate {
         let canonical = Self::normalize_path_for_compare(canonical);
         let ws = Self::normalize_path_for_compare(ws);
 
-        if canonical.starts_with(&ws) {
+        if canonical.starts_with(&ws) || self.extra_read_roots.iter().any(|r| canonical.starts_with(r)) {
             PolicyDecision::Allow
         } else if self.allow_outside_workspace {
             PolicyDecision::Warn(format!(
@@ -445,6 +461,28 @@ impl PolicyGate {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn extra_read_roots_allow_outside_paths_only_under_them() {
+        let dir = env::temp_dir().join(format!("gate-extra-{}", std::process::id()));
+        let dep = dir.join("deps");
+        let other = dir.join("other");
+        std::fs::create_dir_all(&dep).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(dep.join("a.rs"), "x").unwrap();
+        std::fs::write(other.join("b.rs"), "x").unwrap();
+        let g = PolicyGate::new(env::current_dir().unwrap())
+            .with_extra_read_roots(vec![dep.clone()]);
+        assert!(matches!(
+            g.check_path(dep.join("a.rs").to_str().unwrap()),
+            PolicyDecision::Allow
+        ));
+        assert!(matches!(
+            g.check_path(other.join("b.rs").to_str().unwrap()),
+            PolicyDecision::Deny(_)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
     use std::env;
 
