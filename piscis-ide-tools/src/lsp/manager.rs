@@ -81,17 +81,7 @@ impl LspManager {
     /// List all supported languages with auto-detection of installed servers.
     pub fn supported_languages() -> Vec<LanguageSupport> {
         fn is_on_path(cmd: &str) -> bool {
-            #[cfg(windows)]
-            let probe = "where";
-            #[cfg(not(windows))]
-            let probe = "which";
-            piscis_kernel::proc::std_command(probe)
-                .arg(cmd)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false)
+            locate_executable(cmd).is_some()
         }
         vec![
             LanguageSupport {
@@ -102,7 +92,9 @@ impl LspManager {
                 server_args: vec![],
                 // The rustup proxy exists on PATH even when the component is not
                 // installed, so a PATH hit alone is not enough.
-                available: is_on_path("rust-analyzer") && runs_ok("rust-analyzer", "--version"),
+                available: locate_executable("rust-analyzer")
+                    .map(|p| runs_ok(&p, "--version"))
+                    .unwrap_or(false),
             },
             LanguageSupport {
                 language_id: "typescript".into(),
@@ -224,23 +216,7 @@ impl LspManager {
                 return Some(p.to_string_lossy().to_string());
             }
         }
-        #[cfg(windows)]
-        let probe = "where";
-        #[cfg(not(windows))]
-        let probe = "which";
-        let out = piscis_kernel::proc::std_command(probe)
-            .arg(cmd)
-            .stderr(std::process::Stdio::null())
-            .output()
-            .ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .map(str::trim)
-            .find(|l| !l.is_empty())
-            .map(str::to_string)
+        locate_executable(cmd)
     }
 
     /// Persistent, properly-initialized stdio client for agent tools. Respawns
@@ -263,7 +239,7 @@ impl LspManager {
             .find(|l| l.language_id == language)
             .ok_or_else(|| format!("unsupported language: {language}"))?;
         let cmd = Self::resolve_command(&lang.server_command, project_root)
-            .filter(|_| language != "rust" || runs_ok("rust-analyzer", "--version"))
+            .filter(|c| language != "rust" || runs_ok(c, "--version"))
             .ok_or_else(|| {
             format!(
                 "language server '{}' is not installed — {}",
@@ -430,6 +406,88 @@ impl Default for LspManager {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Find an executable on `PATH`, then in well-known per-user tool directories.
+/// GUI-launched apps often inherit a trimmed `PATH` that lacks `~/.cargo/bin`
+/// or the npm global bin dir even though the tools are installed.
+fn locate_executable(cmd: &str) -> Option<String> {
+    #[cfg(windows)]
+    let probe = "where";
+    #[cfg(not(windows))]
+    let probe = "which";
+    if let Ok(out) = piscis_kernel::proc::std_command(probe)
+        .arg(cmd)
+        .stderr(std::process::Stdio::null())
+        .output()
+    {
+        if out.status.success() {
+            let text = String::from_utf8_lossy(&out.stdout).to_string();
+            let hits: Vec<&str> = text
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .collect();
+            // npm installs an extensionless shell shim next to the `.cmd`
+            // one; only the latter is spawnable on Windows.
+            let spawnable = |l: &str| {
+                !cfg!(windows) || {
+                    let lower = l.to_lowercase();
+                    lower.ends_with(".exe") || lower.ends_with(".cmd") || lower.ends_with(".bat")
+                }
+            };
+            if let Some(line) = hits
+                .iter()
+                .copied()
+                .find(|l| spawnable(l))
+                .or_else(|| hits.first().copied())
+            {
+                return Some(line.to_string());
+            }
+        }
+    }
+    let exts: &[&str] = if cfg!(windows) {
+        &[".exe", ".cmd", ".bat", ""]
+    } else {
+        &[""]
+    };
+    for dir in known_tool_dirs() {
+        for ext in exts {
+            let p = dir.join(format!("{cmd}{ext}"));
+            if p.is_file() {
+                return Some(p.to_string_lossy().to_string());
+            }
+        }
+    }
+    None
+}
+
+fn known_tool_dirs() -> Vec<std::path::PathBuf> {
+    use std::path::PathBuf;
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let env_dir = |k: &str| std::env::var_os(k).map(PathBuf::from);
+    if let Some(c) = env_dir("CARGO_HOME") {
+        dirs.push(c.join("bin"));
+    }
+    let home = env_dir("USERPROFILE").or_else(|| env_dir("HOME"));
+    if let Some(h) = &home {
+        dirs.push(h.join(".cargo").join("bin"));
+        dirs.push(h.join(".local").join("bin"));
+        dirs.push(h.join(".npm-global").join("bin"));
+        dirs.push(h.join("go").join("bin"));
+    }
+    if let Some(a) = env_dir("APPDATA") {
+        dirs.push(a.join("npm"));
+    }
+    if let Some(l) = env_dir("LOCALAPPDATA") {
+        dirs.push(l.join("pnpm"));
+    }
+    #[cfg(not(windows))]
+    {
+        dirs.push(PathBuf::from("/usr/local/bin"));
+        dirs.push(PathBuf::from("/opt/homebrew/bin"));
+    }
+    dirs
 }
 
 fn runs_ok(cmd: &str, arg: &str) -> bool {
