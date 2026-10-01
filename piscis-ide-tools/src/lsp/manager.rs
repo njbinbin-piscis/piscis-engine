@@ -8,10 +8,14 @@
 
 use std::collections::HashMap;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::process::Child;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
+
+use crate::lsp::client::LspClient;
 
 /// Unique key for an LSP session: project_dir + language.
 type SessionKey = String;
@@ -41,6 +45,8 @@ struct LspSession {
     language: String,
     /// WebSocket port the bridge is listening on
     port: u16,
+    /// Set once the bridge task ended (it serves exactly one WS client).
+    done: Arc<AtomicBool>,
     /// The child process handle — keeps the process alive.
     /// Dropping this kills the process.
     #[allow(dead_code)]
@@ -50,6 +56,7 @@ struct LspSession {
 /// Global LSP process manager.
 pub struct LspManager {
     sessions: Mutex<HashMap<SessionKey, Arc<LspSession>>>,
+    clients: Mutex<HashMap<SessionKey, Arc<LspClient>>>,
     bridge_app_name: String,
 }
 
@@ -61,6 +68,7 @@ impl LspManager {
     pub fn with_bridge_name(app_name: impl Into<String>) -> Self {
         Self {
             sessions: Mutex::new(HashMap::new()),
+            clients: Mutex::new(HashMap::new()),
             bridge_app_name: app_name.into(),
         }
     }
@@ -92,7 +100,9 @@ impl LspManager {
                 extensions: vec![".rs".into()],
                 server_command: "rust-analyzer".into(),
                 server_args: vec![],
-                available: is_on_path("rust-analyzer"),
+                // The rustup proxy exists on PATH even when the component is not
+                // installed, so a PATH hit alone is not enough.
+                available: is_on_path("rust-analyzer") && runs_ok("rust-analyzer", "--version"),
             },
             LanguageSupport {
                 language_id: "typescript".into(),
@@ -152,6 +162,132 @@ impl LspManager {
         None
     }
 
+    /// Language for a path by extension alone, regardless of whether a server
+    /// binary is installed (used to give an accurate "not installed" message).
+    pub fn language_for_extension(path: &str) -> Option<String> {
+        let lower = path.to_lowercase();
+        Self::supported_languages()
+            .into_iter()
+            .find(|l| l.extensions.iter().any(|e| lower.ends_with(e.as_str())))
+            .map(|l| l.language_id)
+    }
+
+    /// LSP `languageId` for a file (`.tsx` is `typescriptreact`, etc.).
+    pub fn lsp_language_id(path: &str, language: &str) -> String {
+        let lower = path.to_lowercase();
+        let by_ext = [
+            (".tsx", "typescriptreact"),
+            (".ts", "typescript"),
+            (".jsx", "javascriptreact"),
+            (".js", "javascript"),
+            (".mjs", "javascript"),
+            (".cjs", "javascript"),
+            (".hpp", "cpp"),
+            (".hxx", "cpp"),
+            (".cc", "cpp"),
+            (".cxx", "cpp"),
+            (".cpp", "cpp"),
+            (".h", "c"),
+            (".c", "c"),
+        ];
+        for (ext, id) in by_ext {
+            if lower.ends_with(ext) {
+                return id.to_string();
+            }
+        }
+        language.to_string()
+    }
+
+    /// Actionable install hint when a language's server binary is missing.
+    pub fn install_hint(language: &str) -> &'static str {
+        match language {
+            "rust" => "install rust-analyzer (`rustup component add rust-analyzer`)",
+            "typescript" => {
+                "install it with `npm i -g typescript-language-server typescript` (or add both as devDependencies of the project)"
+            }
+            "python" => "install it with `npm i -g pyright` or `pip install pyright`",
+            "cpp" => "install clangd (LLVM)",
+            _ => "install the matching language server",
+        }
+    }
+
+    /// Resolve a server executable: project-local `node_modules/.bin` first,
+    /// then `PATH`. Returns a path usable for spawning.
+    pub fn resolve_command(cmd: &str, project_root: &str) -> Option<String> {
+        let bin = std::path::Path::new(project_root)
+            .join("node_modules")
+            .join(".bin");
+        let candidates: &[&str] = if cfg!(windows) { &[".cmd", ".exe", ""] } else { &[""] };
+        for ext in candidates {
+            let p = bin.join(format!("{cmd}{ext}"));
+            if p.is_file() {
+                return Some(p.to_string_lossy().to_string());
+            }
+        }
+        #[cfg(windows)]
+        let probe = "where";
+        #[cfg(not(windows))]
+        let probe = "which";
+        let out = piscis_kernel::proc::std_command(probe)
+            .arg(cmd)
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .map(str::to_string)
+    }
+
+    /// Persistent, properly-initialized stdio client for agent tools. Respawns
+    /// automatically when the previous server process died.
+    pub async fn client(
+        &self,
+        project_root: &str,
+        language: &str,
+    ) -> Result<Arc<LspClient>, String> {
+        let key = Self::session_key(project_root, language);
+        let mut clients = self.clients.lock().await;
+        if let Some(c) = clients.get(&key) {
+            if c.is_alive() {
+                return Ok(c.clone());
+            }
+            clients.remove(&key);
+        }
+        let lang = Self::supported_languages()
+            .into_iter()
+            .find(|l| l.language_id == language)
+            .ok_or_else(|| format!("unsupported language: {language}"))?;
+        let cmd = Self::resolve_command(&lang.server_command, project_root)
+            .filter(|_| language != "rust" || runs_ok("rust-analyzer", "--version"))
+            .ok_or_else(|| {
+            format!(
+                "language server '{}' is not installed — {}",
+                lang.server_command,
+                Self::install_hint(language)
+            )
+        })?;
+        let mut last_err = String::new();
+        for attempt in 0..2 {
+            match LspClient::spawn(&cmd, &lang.server_args, project_root, language).await {
+                Ok(c) => {
+                    clients.insert(key, c.clone());
+                    return Ok(c);
+                }
+                Err(e) => {
+                    warn!("LSP spawn attempt {} failed: {}", attempt + 1, e);
+                    last_err = e;
+                    tokio::time::sleep(Duration::from_millis(400)).await;
+                }
+            }
+        }
+        Err(last_err)
+    }
+
     /// Get the command and args for a given language.
     fn server_info(language: &str) -> Option<LanguageSupport> {
         Self::supported_languages()
@@ -170,12 +306,16 @@ impl LspManager {
         {
             let sessions = self.sessions.lock().await;
             if let Some(session) = sessions.get(&key) {
-                info!(
-                    "LSP session {}/{} already running on port {}",
-                    project_dir, language, session.port
-                );
-                return Ok(session.port);
+                if !session.done.load(Ordering::SeqCst) {
+                    info!(
+                        "LSP session {}/{} already running on port {}",
+                        project_dir, language, session.port
+                    );
+                    return Ok(session.port);
+                }
             }
+            drop(sessions);
+            self.sessions.lock().await.remove(&key);
         }
 
         // Find server info
@@ -217,6 +357,8 @@ impl LspManager {
         let project_clone = project_dir.to_string();
         let server_name = info.server_command.clone();
         let bridge_name = self.bridge_app_name.clone();
+        let done = Arc::new(AtomicBool::new(false));
+        let done_task = done.clone();
         tokio::spawn(async move {
             if let Err(e) = crate::lsp::bridge::run_lsp_bridge(
                 port,
@@ -231,6 +373,7 @@ impl LspManager {
             {
                 warn!("LSP bridge for {} exited: {}", server_name, e);
             }
+            done_task.store(true, Ordering::SeqCst);
         });
 
         // Store session
@@ -238,6 +381,7 @@ impl LspManager {
             project_dir: project_dir.to_string(),
             language: language.to_string(),
             port,
+            done,
             child,
         });
 
@@ -274,6 +418,7 @@ impl LspManager {
 
     /// Stop all active LSP sessions.
     pub async fn stop_all(&self) {
+        self.clients.lock().await.clear();
         let mut sessions = self.sessions.lock().await;
         let count = sessions.len();
         sessions.clear();
@@ -285,6 +430,17 @@ impl Default for LspManager {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn runs_ok(cmd: &str, arg: &str) -> bool {
+    piscis_kernel::proc::std_command(cmd)
+        .arg(arg)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 /// Try to find an unused TCP port on localhost.

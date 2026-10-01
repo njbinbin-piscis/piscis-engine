@@ -1,17 +1,14 @@
-//! LSP tool for agents — access Language Server Protocol features
-//! (diagnostics, hover, completions, go-to-definition, references, rename)
-//! from within an agent conversation.
-//!
-//! Connects to the LSP WebSocket bridge managed by [`crate::lsp::manager::LspManager`]
-//! and issues JSON-RPC requests on the agent's behalf.
+//! LSP tool for agents — diagnostics, hover, completion, go-to-definition,
+//! references, symbols and rename preview, backed by a real, persistent
+//! language-server session ([`crate::lsp::client::LspClient`]).
 
 use async_trait::async_trait;
 use piscis_kernel::agent::tool::{Tool, ToolContext, ToolResult};
 use serde_json::{json, Value};
 use std::sync::Arc;
-use tokio_tungstenite::tungstenite::Message;
-use tracing::{info, warn};
+use std::time::Duration;
 
+use crate::lsp::client::{uri_to_path, LspClient};
 use crate::lsp::manager::LspManager;
 
 pub struct LspTool {
@@ -25,25 +22,26 @@ impl Tool for LspTool {
     }
 
     fn description(&self) -> &str {
-        "Access Language Server Protocol features for code understanding. \
+        "Semantic code navigation through a real language server (rust-analyzer, \
+         typescript-language-server, pyright, clangd). Prefer this over grep when you \
+         need to know what a symbol IS, where it is DEFINED, or who USES it.\n\
          Actions:\n\
-         - 'diagnostics': Get compiler errors/warnings for a file. \
-         Returns a list of diagnostics (line, column, severity, message).\n\
-         - 'hover': Get type information and documentation for the symbol at \
-         a given line:column position.\n\
-         - 'complete': Get code completions at a given position. \
-         Useful for discovering available methods, fields, or APIs.\n\
-         - 'definition': Get the location where the symbol at the given \
-         position is defined (go-to-definition).\n\
-         - 'references': Find all references to the symbol at the given position.\n\
-         - 'rename': Rename a symbol across the project. \
-         Requires 'new_name' parameter.\n\
-         \n\
-         Each request requires: file (absolute path), line, character (0-based column). \
-         For best results, use the language that matches the file extension \
-         (e.g., 'rust' for .rs, 'typescript' for .ts, 'python' for .py, 'cpp' for .c/.cpp). \
-         The 'definition' and 'references' actions help you navigate and understand \
-         code structure without manual grep/search."
+         - 'definition': where the symbol at file:line:character is defined.\n\
+         - 'references': every usage of that symbol (use before changing a signature \
+         or renaming).\n\
+         - 'hover': type / documentation of the symbol.\n\
+         - 'diagnostics': compiler/type errors for the file (no line/character needed).\n\
+         - 'symbols': outline of the file (functions, types, methods with line numbers; \
+         no line/character needed).\n\
+         - 'workspace_symbols': find symbols by name across the project (needs 'query'; \
+         'file' only selects which project/language).\n\
+         - 'complete': completions at a position.\n\
+         - 'rename': PREVIEW of a project-wide rename (needs 'new_name'); it lists the \
+         affected files but does not modify them — apply the edits yourself.\n\
+         Positions: 'line' is 1-based, 'character' is the 0-based column. The first call \
+         for a language starts its server and can take several seconds. If the server \
+         is not installed the error says how to install it; then fall back to \
+         codebase_search / file_search."
     }
 
     fn input_schema(&self) -> Value {
@@ -52,27 +50,17 @@ impl Tool for LspTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["diagnostics", "hover", "complete", "definition", "references", "rename"],
+                    "enum": ["definition", "references", "hover", "diagnostics", "symbols",
+                             "workspace_symbols", "complete", "rename"],
                     "description": "LSP action to perform."
                 },
-                "file": {
-                    "type": "string",
-                    "description": "Absolute path to the source file."
-                },
-                "line": {
-                    "type": "integer",
-                    "description": "1-based line number."
-                },
-                "character": {
-                    "type": "integer",
-                    "description": "0-based character (column) offset on the line."
-                },
-                "new_name": {
-                    "type": "string",
-                    "description": "New name for rename action. Required only for 'rename'."
-                }
+                "file": { "type": "string", "description": "Absolute path to the source file." },
+                "line": { "type": "integer", "description": "1-based line (definition/references/hover/complete/rename)." },
+                "character": { "type": "integer", "description": "0-based column (same actions as 'line')." },
+                "new_name": { "type": "string", "description": "Required for 'rename'." },
+                "query": { "type": "string", "description": "Symbol name for 'workspace_symbols'." }
             },
-            "required": ["action", "file", "line", "character"]
+            "required": ["action", "file"]
         })
     }
 
@@ -81,49 +69,144 @@ impl Tool for LspTool {
     }
 
     async fn call(&self, input: Value, _ctx: &ToolContext) -> anyhow::Result<ToolResult> {
-        let action = input["action"]
-            .as_str()
-            .unwrap_or("diagnostics")
-            .to_string();
+        let action = input["action"].as_str().unwrap_or("diagnostics").to_string();
         let file = input["file"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("'file' parameter is required"))?
             .to_string();
-        let line = input["line"].as_u64().unwrap_or(1) as usize;
-        let character = input["character"].as_u64().unwrap_or(0) as usize;
+        let position_actions = ["definition", "references", "hover", "complete", "rename"];
+        if position_actions.contains(&action.as_str())
+            && (input.get("line").is_none() || input.get("character").is_none())
+        {
+            return Ok(ToolResult::err(format!(
+                "'{action}' needs both 'line' (1-based) and 'character' (0-based)"
+            )));
+        }
+        if !std::path::Path::new(&file).is_file() {
+            return Ok(ToolResult::err(format!("file not found: {file}")));
+        }
 
-        // Detect language from file extension
-        let project_root = detect_project_root(&file);
-        let language = match LspManager::language_for_file(&file) {
+        let language = match LspManager::language_for_extension(&file) {
             Some(l) => l,
             None => {
                 return Ok(ToolResult::err(format!(
-                    "No LSP server available for file: {}. Supported languages: rust, typescript, python, c/c++",
-                    file
+                    "no language server is mapped to this file type ({file}). Mapped: {}",
+                    mapped_languages()
                 )));
             }
         };
-
-        // Start LSP if needed and get port
-        let port = match self.lsp_manager.start(&project_root, &language).await {
-            Ok(p) => p,
-            Err(e) => {
-                return Ok(ToolResult::err(format!(
-                    "Failed to start LSP server for {}: {}",
-                    language, e
-                )));
-            }
+        let root = detect_project_root(&file);
+        let client = match self.lsp_manager.client(&root, &language).await {
+            Ok(c) => c,
+            Err(e) => return Ok(ToolResult::err(format!("LSP unavailable for {language}: {e}"))),
         };
-
-        // Connect via WebSocket
-        let result =
-            match lsp_request(port, &file, &language, &action, line, character, &input).await {
-                Ok(text) => ToolResult::ok(text),
-                Err(e) => ToolResult::err(e),
-            };
-
-        Ok(result)
+        match run_action(&client, &action, &file, &language, &input).await {
+            Ok(text) => Ok(ToolResult::ok(text)),
+            Err(e) => Ok(ToolResult::err(e)),
+        }
     }
+}
+
+fn mapped_languages() -> String {
+    LspManager::supported_languages()
+        .iter()
+        .map(|l| {
+            format!(
+                "{} ({})",
+                l.language_id,
+                if l.available { "installed" } else { "server not installed" }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+async fn run_action(
+    client: &LspClient,
+    action: &str,
+    file: &str,
+    language: &str,
+    input: &Value,
+) -> Result<String, String> {
+    let lsp_id = LspManager::lsp_language_id(file, language);
+    let (uri, changed) = client.sync_file(file, &lsp_id).await?;
+
+    if action == "diagnostics" {
+        let diags = client
+            .diagnostics(&uri, changed, Duration::from_secs(8))
+            .await;
+        return Ok(format_diagnostics(&diags));
+    }
+
+    let line = input["line"].as_u64().unwrap_or(1).saturating_sub(1);
+    let character = input["character"].as_u64().unwrap_or(0);
+    let position = json!({ "line": line, "character": character });
+    let td = json!({ "uri": uri });
+
+    let (method, params) = match action {
+        "hover" => ("textDocument/hover", json!({ "textDocument": td, "position": position })),
+        "complete" => (
+            "textDocument/completion",
+            json!({ "textDocument": td, "position": position, "context": { "triggerKind": 1 } }),
+        ),
+        "definition" => (
+            "textDocument/definition",
+            json!({ "textDocument": td, "position": position }),
+        ),
+        "references" => (
+            "textDocument/references",
+            json!({ "textDocument": td, "position": position,
+                    "context": { "includeDeclaration": true } }),
+        ),
+        "rename" => {
+            let new_name = input["new_name"]
+                .as_str()
+                .ok_or("'rename' requires 'new_name'")?;
+            (
+                "textDocument/rename",
+                json!({ "textDocument": td, "position": position, "newName": new_name }),
+            )
+        }
+        "symbols" => ("textDocument/documentSymbol", json!({ "textDocument": td })),
+        "workspace_symbols" => {
+            let q = input["query"].as_str().ok_or("'workspace_symbols' requires 'query'")?;
+            ("workspace/symbol", json!({ "query": q }))
+        }
+        other => return Err(format!("unknown action '{other}'")),
+    };
+
+    if changed {
+        tokio::time::sleep(Duration::from_millis(600)).await;
+    }
+    let mut last_err = String::new();
+    for attempt in 0..4 {
+        match client.request(method, params.clone(), Duration::from_secs(30)).await {
+            Ok(result) => {
+                let empty = result.is_null()
+                    || result.as_array().is_some_and(|a| a.is_empty());
+                // A freshly started server is often still indexing and answers
+                // with an empty result; give it a couple more chances.
+                if empty && attempt < 2 && changed {
+                    tokio::time::sleep(Duration::from_millis(1500)).await;
+                    continue;
+                }
+                return Ok(format_result(action, &result));
+            }
+            Err(e) => {
+                let retryable = {
+                    let l = e.to_lowercase();
+                    l.contains("content modified") || l.contains("contentmodified")
+                        || l.contains("waiting") || l.contains("not initialized")
+                };
+                last_err = e;
+                if !retryable {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1500)).await;
+            }
+        }
+    }
+    Err(format!("LSP {action} failed: {last_err}"))
 }
 
 /// Detect project root from a file path by looking for common markers.
@@ -140,12 +223,15 @@ fn detect_project_root(file: &str) -> String {
     let markers = [
         "Cargo.toml",
         "package.json",
+        "tsconfig.json",
         "pyproject.toml",
         "setup.py",
         "CMakeLists.txt",
         "Makefile",
     ];
 
+    // Prefer the outermost Cargo workspace / package root nearest the file; the
+    // first marker wins, which matches how the servers locate their project.
     loop {
         for marker in &markers {
             if current.join(marker).exists() {
@@ -159,433 +245,211 @@ fn detect_project_root(file: &str) -> String {
         }
     }
 
-    // Fallback to the file's directory
     std::path::Path::new(file)
         .parent()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|| ".".to_string())
 }
 
-/// Connect to the LSP WebSocket bridge, issue a request, and return the response.
-async fn lsp_request(
-    port: u16,
-    file: &str,
-    language: &str,
-    action: &str,
-    line: usize,
-    character: usize,
-    full_input: &Value,
-) -> Result<String, String> {
-    use futures::{SinkExt, StreamExt};
-    use tokio_tungstenite::connect_async;
-
-    let url = format!("ws://127.0.0.1:{}", port);
-    info!("LspTool: connecting to {}", url);
-
-    let (mut ws, _) = connect_async(&url)
-        .await
-        .map_err(|e| format!("Failed to connect to LSP bridge on port {}: {}", port, e))?;
-
-    // 1) Send initialize request
-    let init_req = json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "initialize",
-        "params": {
-            "processId": null,
-            "rootUri": format!("file://{}", detect_project_root(file)),
-            "capabilities": {
-                "textDocument": {
-                    "hover": { "contentFormat": ["markdown", "plaintext"] },
-                    "completion": { "completionItem": { "snippetSupport": true } },
-                    "definition": { "linkSupport": true },
-                    "references": {},
-                    "rename": { "prepareSupport": true },
-                    "publishDiagnostics": { "relatedInformation": true }
-                }
-            },
-            "workspaceFolders": [{
-                "uri": format!("file://{}", detect_project_root(file)),
-                "name": "project"
-            }]
-        }
-    });
-
-    // LSP uses Content-Length framing
-    let init_str = serde_json::to_string(&init_req).unwrap();
-    let framed = format!("Content-Length: {}\r\n\r\n{}", init_str.len(), init_str);
-    ws.send(Message::Text(framed))
-        .await
-        .map_err(|e| format!("WS send error: {}", e))?;
-
-    // Read initialize response (skip canned response + real response)
-    let mut got_init = false;
-    while let Some(Ok(Message::Text(text))) = ws.next().await {
-        if text.contains("\"initialize\"") || text.contains("\"id\":1") {
-            got_init = true;
-            break;
-        }
-    }
-    if !got_init {
-        return Err("LSP init: no response received".to_string());
-    }
-
-    // Send initialized notification
-    let init_done = json!({
-        "jsonrpc": "2.0",
-        "method": "initialized",
-        "params": {}
-    });
-    let init_done_str = serde_json::to_string(&init_done).unwrap();
-    ws.send(Message::Text(format!(
-        "Content-Length: {}\r\n\r\n{}",
-        init_done_str.len(),
-        init_done_str
-    )))
-    .await
-    .map_err(|e| format!("WS send error: {}", e))?;
-
-    // 2) Send didOpen notification (tell LSP about the file)
-    let (content, _) = read_file_content(file)?;
-    let lsp_lang = language_to_lsp_id(language);
-    let did_open = json!({
-        "jsonrpc": "2.0",
-        "method": "textDocument/didOpen",
-        "params": {
-            "textDocument": {
-                "uri": format!("file://{}", file),
-                "languageId": lsp_lang,
-                "version": 1,
-                "text": content
-            }
-        }
-    });
-    let did_open_str = serde_json::to_string(&did_open).unwrap();
-    ws.send(Message::Text(format!(
-        "Content-Length: {}\r\n\r\n{}",
-        did_open_str.len(),
-        did_open_str
-    )))
-    .await
-    .map_err(|e| format!("WS send error: {}", e))?;
-
-    // Small delay to let LSP process didOpen and build index
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-    // 3) Send the actual request based on action
-    let request_id = 2u64;
-    let lsp_request = build_lsp_request(
-        request_id, action, file, line, character, full_input, lsp_lang,
-    );
-    let req_str = serde_json::to_string(&lsp_request).unwrap();
-    ws.send(Message::Text(format!(
-        "Content-Length: {}\r\n\r\n{}",
-        req_str.len(),
-        req_str
-    )))
-    .await
-    .map_err(|e| format!("WS send error: {}", e))?;
-
-    // 4) Read responses until we get our result
-    let mut result_text = String::new();
-    let mut diagnostics: Vec<Value> = Vec::new();
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
-
-    loop {
-        if tokio::time::Instant::now() > deadline {
-            if !result_text.is_empty() {
-                break;
-            }
-            return Err("LSP request timed out".to_string());
-        }
-
-        match tokio::time::timeout(std::time::Duration::from_secs(2), ws.next()).await {
-            Ok(Some(Ok(Message::Text(text)))) => {
-                // Strip Content-Length header if present
-                let body = if let Some(idx) = text.find("\r\n\r\n") {
-                    text[idx + 4..].to_string()
-                } else {
-                    text
-                };
-
-                if let Ok(val) = serde_json::from_str::<Value>(&body) {
-                    // Check if it's our response
-                    if val.get("id").and_then(|i| i.as_u64()) == Some(request_id) {
-                        if let Some(result) = val.get("result") {
-                            result_text = format_lsp_result(action, result, &diagnostics);
-                            break;
-                        }
-                        if let Some(error) = val.get("error") {
-                            return Err(format!(
-                                "LSP error: {}",
-                                error
-                                    .get("message")
-                                    .and_then(|m| m.as_str())
-                                    .unwrap_or("unknown error")
-                            ));
-                        }
-                    }
-
-                    // Collect diagnostics from publishDiagnostics notifications
-                    if val.get("method").and_then(|m| m.as_str())
-                        == Some("textDocument/publishDiagnostics")
-                    {
-                        if let Some(params) = val.get("params") {
-                            if let Some(diags) =
-                                params.get("diagnostics").and_then(|d| d.as_array())
-                            {
-                                diagnostics.extend(diags.iter().cloned());
-                            }
-                        }
-                    }
-                }
-            }
-            Ok(Some(Ok(Message::Close(_)))) => break,
-            Ok(Some(Err(e))) => {
-                warn!("WS recv error: {}", e);
-                break;
-            }
-            Ok(None) => break,
-            Err(_) if !result_text.is_empty() || !diagnostics.is_empty() => {
-                // Timeout, check if we have enough data
-                break;
-            }
-            Err(_) => {}
-            _ => {} // ignore Binary/Ping/Pong/Frame
-        }
-    }
-
-    // Close the connection
-    let _ = ws.close(None).await;
-
-    if result_text.is_empty() && !diagnostics.is_empty() {
-        result_text = format_diagnostics(&diagnostics);
-    }
-
-    if result_text.is_empty() {
-        result_text = format!(
-            "LSP {} returned empty result for {} at line {}, char {}",
-            action, file, line, character
-        );
-    }
-
-    Ok(result_text)
-}
-
-/// Build an LSP JSON-RPC request based on the action.
-fn build_lsp_request(
-    id: u64,
-    action: &str,
-    file: &str,
-    line: usize,
-    character: usize,
-    full_input: &Value,
-    _lsp_lang: &str,
-) -> Value {
-    let uri = format!("file://{}", file);
-    let position = json!({
-        "line": line.saturating_sub(1),  // LSP uses 0-based lines
-        "character": character
-    });
-
+fn format_result(action: &str, result: &Value) -> String {
     match action {
-        "diagnostics" => json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": "textDocument/diagnostic",
-            "params": {
-                "textDocument": { "uri": uri.clone() }
-            }
-        }),
-        "hover" => json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": "textDocument/hover",
-            "params": {
-                "textDocument": { "uri": uri.clone() },
-                "position": position
-            }
-        }),
-        "complete" => json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": "textDocument/completion",
-            "params": {
-                "textDocument": { "uri": uri.clone() },
-                "position": position,
-                "context": { "triggerKind": 1 }
-            }
-        }),
-        "definition" => json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": "textDocument/definition",
-            "params": {
-                "textDocument": { "uri": uri.clone() },
-                "position": position
-            }
-        }),
-        "references" => json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": "textDocument/references",
-            "params": {
-                "textDocument": { "uri": uri.clone() },
-                "position": position,
-                "context": { "includeDeclaration": true }
-            }
-        }),
-        "rename" => {
-            let new_name = full_input["new_name"].as_str().unwrap_or("new_name");
-            json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "method": "textDocument/rename",
-                "params": {
-                    "textDocument": { "uri": uri.clone() },
-                    "position": position,
-                    "newName": new_name
-                }
-            })
-        }
-        _ => json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": "textDocument/hover",
-            "params": {
-                "textDocument": { "uri": uri.clone() },
-                "position": position
-            }
-        }),
-    }
-}
-
-/// Format an LSP result into human-readable text for the agent.
-fn format_lsp_result(action: &str, result: &Value, diagnostics: &[Value]) -> String {
-    match action {
-        "diagnostics" => {
-            if diagnostics.is_empty() {
-                "No diagnostics found.".to_string()
-            } else {
-                format_diagnostics(diagnostics)
-            }
-        }
-        "hover" => {
-            if let Some(contents) = result.get("contents") {
-                let text = match contents {
-                    Value::String(s) => s.clone(),
-                    Value::Object(obj) => obj
-                        .get("value")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("(hover info)")
-                        .to_string(),
-                    _ => "(hover info)".to_string(),
-                };
-                format!("Hover: {}", text)
-            } else {
-                "No hover information available at this position.".to_string()
-            }
-        }
+        "hover" => match result.get("contents") {
+            Some(Value::String(s)) => format!("Hover: {s}"),
+            Some(Value::Object(o)) => format!(
+                "Hover: {}",
+                o.get("value").and_then(|v| v.as_str()).unwrap_or("(hover info)")
+            ),
+            Some(Value::Array(a)) => format!(
+                "Hover: {}",
+                a.iter()
+                    .filter_map(|v| v.as_str().or_else(|| v.get("value").and_then(|x| x.as_str())))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
+            _ => "No hover information at this position.".to_string(),
+        },
         "complete" => {
-            if let Some(items) = result.get("items").and_then(|i| i.as_array()) {
-                let completions: Vec<String> = items
-                    .iter()
-                    .take(30)
-                    .map(|item| {
-                        let label = item.get("label").and_then(|l| l.as_str()).unwrap_or("?");
-                        let detail = item
-                            .get("detail")
-                            .and_then(|d| d.as_str())
-                            .map(|d| format!(" — {}", d))
-                            .unwrap_or_default();
-                        format!("  - {}{}", label, detail)
-                    })
-                    .collect();
-                if completions.is_empty() {
-                    "No completions available.".to_string()
-                } else {
-                    format!(
-                        "Completions ({} total):\n{}",
-                        items.len(),
-                        completions.join("\n")
-                    )
+            let items = result
+                .get("items")
+                .and_then(|i| i.as_array())
+                .or_else(|| result.as_array());
+            match items {
+                Some(items) if !items.is_empty() => {
+                    let lines: Vec<String> = items
+                        .iter()
+                        .take(30)
+                        .map(|it| {
+                            let label = it.get("label").and_then(|l| l.as_str()).unwrap_or("?");
+                            let detail = it
+                                .get("detail")
+                                .and_then(|d| d.as_str())
+                                .map(|d| format!(" — {d}"))
+                                .unwrap_or_default();
+                            format!("  - {label}{detail}")
+                        })
+                        .collect();
+                    format!("Completions ({} total):\n{}", items.len(), lines.join("\n"))
                 }
-            } else {
-                "No completions available.".to_string()
+                _ => "No completions available.".to_string(),
             }
         }
         "definition" => {
-            let locations: Vec<String> = match result {
-                Value::Array(arr) => arr.iter().filter_map(format_location).collect(),
-                Value::Object(_) => {
-                    vec![format_location(result).unwrap_or_default()]
-                }
-                _ => vec![],
-            };
-            if locations.is_empty() {
+            let locs = locations(result);
+            if locs.is_empty() {
                 "Definition not found.".to_string()
             } else {
-                format!("Definitions found:\n{}", locations.join("\n"))
+                format!("Definitions:\n{}", locs.join("\n"))
             }
         }
         "references" => {
-            if let Some(arr) = result.as_array() {
-                let refs: Vec<String> = arr.iter().filter_map(format_location).collect();
-                if refs.is_empty() {
-                    "No references found.".to_string()
-                } else {
-                    format!(
-                        "{} reference(s) found:\n{}",
-                        refs.len(),
-                        refs.iter().take(50).cloned().collect::<Vec<_>>().join("\n")
-                    )
-                }
-            } else {
+            let locs = locations(result);
+            if locs.is_empty() {
                 "No references found.".to_string()
-            }
-        }
-        "rename" => {
-            if let Some(changes) = result
-                .get("changes")
-                .or_else(|| result.get("documentChanges"))
-            {
-                let count = if let Some(obj) = changes.as_object() {
-                    obj.values()
-                        .filter_map(|v| v.as_array())
-                        .map(|a| a.len())
-                        .sum()
-                } else {
-                    0
-                };
-                format!("Rename completed. {} file(s) modified.", count)
             } else {
-                "Rename completed.".to_string()
+                let more = locs.len().saturating_sub(80);
+                let mut out = format!(
+                    "{} reference(s):\n{}",
+                    locs.len(),
+                    locs.iter().take(80).cloned().collect::<Vec<_>>().join("\n")
+                );
+                if more > 0 {
+                    out.push_str(&format!("\n  ... and {more} more"));
+                }
+                out
             }
         }
-        _ => format!(
-            "LSP result: {}",
-            serde_json::to_string_pretty(result).unwrap_or_default()
-        ),
+        "rename" => format_rename(result),
+        "symbols" => {
+            let mut lines = Vec::new();
+            flatten_symbols(result, 0, &mut lines);
+            if lines.is_empty() {
+                "No symbols found.".to_string()
+            } else {
+                lines.join("\n")
+            }
+        }
+        "workspace_symbols" => {
+            let arr = result.as_array().cloned().unwrap_or_default();
+            if arr.is_empty() {
+                return "No matching symbols.".to_string();
+            }
+            let lines: Vec<String> = arr
+                .iter()
+                .take(60)
+                .map(|s| {
+                    let name = s.get("name").and_then(|n| n.as_str()).unwrap_or("?");
+                    let kind = symbol_kind(s.get("kind").and_then(|k| k.as_u64()).unwrap_or(0));
+                    let loc = s
+                        .get("location")
+                        .and_then(format_location)
+                        .unwrap_or_default();
+                    format!("  {kind} {name} @ {}", loc.trim_start())
+                })
+                .collect();
+            format!("{} symbol(s):\n{}", arr.len(), lines.join("\n"))
+        }
+        _ => serde_json::to_string_pretty(result).unwrap_or_default(),
     }
 }
 
-/// Format a single LSP location into a human-readable string.
+fn locations(result: &Value) -> Vec<String> {
+    match result {
+        Value::Array(arr) => arr.iter().filter_map(location_or_link).collect(),
+        Value::Object(_) => location_or_link(result).into_iter().collect(),
+        _ => vec![],
+    }
+}
+
+fn location_or_link(v: &Value) -> Option<String> {
+    if v.get("targetUri").is_some() {
+        let uri = v.get("targetUri")?.as_str()?;
+        let range = v.get("targetSelectionRange").or_else(|| v.get("targetRange"))?;
+        return Some(fmt_loc(uri, range));
+    }
+    format_location(v)
+}
+
 fn format_location(loc: &Value) -> Option<String> {
-    let uri = loc.get("uri").and_then(|u| u.as_str()).unwrap_or("?");
-    let range = loc.get("range");
-    let start = range.and_then(|r| r.get("start"));
+    let uri = loc.get("uri")?.as_str()?;
+    Some(fmt_loc(uri, loc.get("range")?))
+}
 
-    let line = start
-        .and_then(|s| s.get("line").and_then(|l| l.as_u64()))
-        .unwrap_or(0) as usize
-        + 1; // Convert 0-based to 1-based
+fn fmt_loc(uri: &str, range: &Value) -> String {
+    let start = range.get("start");
+    let line = start.and_then(|s| s.get("line")).and_then(|l| l.as_u64()).unwrap_or(0) + 1;
     let col = start
-        .and_then(|s| s.get("character").and_then(|c| c.as_u64()))
-        .unwrap_or(0) as usize;
+        .and_then(|s| s.get("character"))
+        .and_then(|c| c.as_u64())
+        .unwrap_or(0);
+    format!("  {}:{}:{}", uri_to_path(uri), line, col)
+}
 
-    // Strip file:// prefix
-    let path = uri.strip_prefix("file://").unwrap_or(uri);
-    Some(format!("  {}:{}:{}", path, line, col))
+fn format_rename(result: &Value) -> String {
+    let mut per_file: Vec<(String, usize)> = Vec::new();
+    if let Some(changes) = result.get("changes").and_then(|c| c.as_object()) {
+        for (uri, edits) in changes {
+            per_file.push((uri_to_path(uri), edits.as_array().map_or(0, |a| a.len())));
+        }
+    }
+    if let Some(docs) = result.get("documentChanges").and_then(|d| d.as_array()) {
+        for d in docs {
+            if let Some(uri) = d.pointer("/textDocument/uri").and_then(|u| u.as_str()) {
+                per_file.push((
+                    uri_to_path(uri),
+                    d.get("edits").and_then(|e| e.as_array()).map_or(0, |a| a.len()),
+                ));
+            }
+        }
+    }
+    if per_file.is_empty() {
+        return "Rename produced no edits (symbol not renameable at this position).".to_string();
+    }
+    let total: usize = per_file.iter().map(|(_, n)| n).sum();
+    let mut out = format!(
+        "Rename PREVIEW (nothing was modified): {total} edit(s) in {} file(s). Apply them with file_edit.\n",
+        per_file.len()
+    );
+    for (p, n) in per_file {
+        out.push_str(&format!("  {p}: {n} edit(s)\n"));
+    }
+    out
+}
+
+fn symbol_kind(k: u64) -> &'static str {
+    match k {
+        2 => "module",
+        5 => "class",
+        6 => "method",
+        8 => "field",
+        9 => "constructor",
+        10 => "enum",
+        11 => "interface",
+        12 => "fn",
+        13 => "var",
+        14 => "const",
+        22 => "enum-member",
+        23 => "struct",
+        _ => "sym",
+    }
+}
+
+fn flatten_symbols(v: &Value, depth: usize, out: &mut Vec<String>) {
+    let Some(arr) = v.as_array() else { return };
+    for s in arr {
+        let name = s.get("name").and_then(|n| n.as_str()).unwrap_or("?");
+        let kind = symbol_kind(s.get("kind").and_then(|k| k.as_u64()).unwrap_or(0));
+        let line = s
+            .pointer("/selectionRange/start/line")
+            .or_else(|| s.pointer("/range/start/line"))
+            .or_else(|| s.pointer("/location/range/start/line"))
+            .and_then(|l| l.as_u64())
+            .unwrap_or(0)
+            + 1;
+        out.push(format!("{}{kind} {name}  (line {line})", "  ".repeat(depth)));
+        if let Some(children) = s.get("children") {
+            flatten_symbols(children, depth + 1, out);
+        }
+    }
 }
 
 /// Format diagnostics array into text.
@@ -593,13 +457,9 @@ fn format_diagnostics(diagnostics: &[Value]) -> String {
     if diagnostics.is_empty() {
         return "No diagnostics found.".to_string();
     }
-
-    let mut lines = Vec::new();
-    lines.push(format!("{} diagnostic(s):", diagnostics.len()));
-
+    let mut lines = vec![format!("{} diagnostic(s):", diagnostics.len())];
     for (i, diag) in diagnostics.iter().enumerate().take(50) {
-        let severity = diag.get("severity").and_then(|s| s.as_u64()).unwrap_or(3);
-        let severity_str = match severity {
+        let severity = match diag.get("severity").and_then(|s| s.as_u64()).unwrap_or(3) {
             1 => "ERROR",
             2 => "WARNING",
             3 => "INFO",
@@ -607,230 +467,85 @@ fn format_diagnostics(diagnostics: &[Value]) -> String {
             _ => "?",
         };
         let message = diag.get("message").and_then(|m| m.as_str()).unwrap_or("?");
-
-        let range = diag.get("range");
-        let start = range.and_then(|r| r.get("start"));
-        let line = start
-            .and_then(|s| s.get("line").and_then(|l| l.as_u64()))
-            .unwrap_or(0) as usize
-            + 1;
+        let start = diag.get("range").and_then(|r| r.get("start"));
+        let line = start.and_then(|s| s.get("line")).and_then(|l| l.as_u64()).unwrap_or(0) + 1;
         let col = start
-            .and_then(|s| s.get("character").and_then(|c| c.as_u64()))
-            .unwrap_or(0) as usize;
-
-        let source = diag.get("source").and_then(|s| s.as_str()).unwrap_or("");
-
+            .and_then(|s| s.get("character"))
+            .and_then(|c| c.as_u64())
+            .unwrap_or(0);
+        let source = diag
+            .get("source")
+            .and_then(|s| s.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| format!(" ({s})"))
+            .unwrap_or_default();
         let code = diag
             .get("code")
-            .map(|c| format!(" [{}]", c))
+            .map(|c| format!(" [{}]", c.as_str().map_or_else(|| c.to_string(), str::to_string)))
             .unwrap_or_default();
-
-        let source_str = if source.is_empty() {
-            String::new()
-        } else {
-            format!(" ({})", source)
-        };
-
         lines.push(format!(
-            "  {}. [{}]{} line {}:{} — {}{}",
-            i + 1,
-            severity_str,
-            source_str,
-            line,
-            col,
-            message,
-            code
+            "  {}. [{severity}]{source} line {line}:{col} — {message}{code}",
+            i + 1
         ));
     }
-
     if diagnostics.len() > 50 {
-        lines.push(format!(
-            "  ... and {} more diagnostics",
-            diagnostics.len() - 50
-        ));
+        lines.push(format!("  ... and {} more diagnostics", diagnostics.len() - 50));
     }
-
     lines.join("\n")
 }
 
-/// Read file content (simplified relative to ide_read_file).
-fn read_file_content(path: &str) -> Result<(String, String), String> {
-    let raw = std::fs::read(path).map_err(|e| format!("Cannot read {}: {}", path, e))?;
-    if raw.len() > 2 * 1024 * 1024 {
-        return Err("File too large (>2MB)".to_string());
-    }
-    let content = String::from_utf8_lossy(&raw).to_string();
-    // Detect language from path
-    let lang = LspManager::language_for_file(path).unwrap_or_else(|| "plaintext".to_string());
-    Ok((content, lang))
-}
-
-/// Map Monaco language ID to LSP language ID.
-pub(crate) fn language_to_lsp_id(lang: &str) -> &str {
-    match lang {
-        "rust" => "rust",
-        "typescript" => "typescript",
-        "python" => "python",
-        "cpp" => "cpp",
-        _ => lang,
-    }
-}
-
-/// Connect to the LSP bridge, open the file, and collect any
-/// `textDocument/publishDiagnostics` notifications emitted within the timeout.
-///
-/// This is the building block reused by both the `lsp` tool's `diagnostics`
-/// action and the standalone `read_lints` tool. Returns the raw `Diagnostic[]`
-/// JSON array (LSP shape: `{ range, severity, message, source?, code? }`).
+/// Open `file` in the language server and return its diagnostics.
 pub(crate) async fn collect_diagnostics_for_file(
-    port: u16,
+    manager: &LspManager,
     file: &str,
     language: &str,
     project_root: &str,
     wait_ms: u64,
 ) -> Result<Vec<Value>, String> {
-    use futures::{SinkExt, StreamExt};
-    use tokio_tungstenite::connect_async;
-
-    let url = format!("ws://127.0.0.1:{}", port);
-    let (mut ws, _) = connect_async(&url)
-        .await
-        .map_err(|e| format!("Failed to connect to LSP bridge on port {}: {}", port, e))?;
-
-    // initialize
-    let init_req = json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "initialize",
-        "params": {
-            "processId": null,
-            "rootUri": format!("file://{}", project_root),
-            "capabilities": {
-                "textDocument": {
-                    "publishDiagnostics": { "relatedInformation": true }
-                }
-            },
-            "workspaceFolders": [{
-                "uri": format!("file://{}", project_root),
-                "name": "project"
-            }]
-        }
-    });
-    let init_str = serde_json::to_string(&init_req).unwrap();
-    ws.send(Message::Text(format!(
-        "Content-Length: {}\r\n\r\n{}",
-        init_str.len(),
-        init_str
-    )))
-    .await
-    .map_err(|e| format!("WS send error: {}", e))?;
-
-    // wait for init response (canned or real)
-    let init_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    while tokio::time::Instant::now() < init_deadline {
-        match tokio::time::timeout(std::time::Duration::from_millis(500), ws.next()).await {
-            Ok(Some(Ok(Message::Text(t)))) => {
-                if t.contains("\"id\":1") || t.contains("\"id\":0") {
-                    break;
-                }
-            }
-            Ok(Some(Ok(_))) => {}
-            Ok(Some(Err(e))) => return Err(format!("WS error during init: {}", e)),
-            Ok(None) => return Err("WS closed during init".into()),
-            Err(_) => {}
-        }
-    }
-
-    // initialized
-    let init_done = json!({ "jsonrpc": "2.0", "method": "initialized", "params": {} });
-    let init_done_str = serde_json::to_string(&init_done).unwrap();
-    ws.send(Message::Text(format!(
-        "Content-Length: {}\r\n\r\n{}",
-        init_done_str.len(),
-        init_done_str
-    )))
-    .await
-    .map_err(|e| format!("WS send error: {}", e))?;
-
-    // didOpen
-    let (content, _) = read_file_content(file)?;
-    let lsp_lang = language_to_lsp_id(language);
-    let did_open = json!({
-        "jsonrpc": "2.0",
-        "method": "textDocument/didOpen",
-        "params": {
-            "textDocument": {
-                "uri": format!("file://{}", file),
-                "languageId": lsp_lang,
-                "version": 1,
-                "text": content
-            }
-        }
-    });
-    let did_open_str = serde_json::to_string(&did_open).unwrap();
-    ws.send(Message::Text(format!(
-        "Content-Length: {}\r\n\r\n{}",
-        did_open_str.len(),
-        did_open_str
-    )))
-    .await
-    .map_err(|e| format!("WS send error: {}", e))?;
-
-    // collect publishDiagnostics for up to wait_ms
-    let target_uri = format!("file://{}", file);
-    let mut diagnostics: Vec<Value> = Vec::new();
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(wait_ms);
-
-    while tokio::time::Instant::now() < deadline {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        match tokio::time::timeout(
-            remaining.min(std::time::Duration::from_millis(400)),
-            ws.next(),
-        )
-        .await
-        {
-            Ok(Some(Ok(Message::Text(text)))) => {
-                let body = if let Some(idx) = text.find("\r\n\r\n") {
-                    &text[idx + 4..]
-                } else {
-                    text.as_str()
-                };
-                if let Ok(val) = serde_json::from_str::<Value>(body) {
-                    if val.get("method").and_then(|m| m.as_str())
-                        == Some("textDocument/publishDiagnostics")
-                    {
-                        if let Some(params) = val.get("params") {
-                            let uri = params.get("uri").and_then(|u| u.as_str()).unwrap_or("");
-                            if uri == target_uri {
-                                if let Some(arr) =
-                                    params.get("diagnostics").and_then(|d| d.as_array())
-                                {
-                                    diagnostics = arr.clone();
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            Ok(Some(Ok(Message::Close(_)))) => break,
-            Ok(Some(Err(_))) => break,
-            Ok(None) => break,
-            Err(_) => {} // timeout slice; loop until overall deadline
-            _ => {}      // ignore Binary/Ping/Pong/Frame
-        }
-    }
-
-    let _ = ws.close(None).await;
-    Ok(diagnostics)
+    let client = manager.client(project_root, language).await?;
+    let lsp_id = LspManager::lsp_language_id(file, language);
+    let (uri, changed) = client.sync_file(file, &lsp_id).await?;
+    Ok(client
+        .diagnostics(&uri, changed, Duration::from_millis(wait_ms))
+        .await)
 }
 
-/// Public re-export of `format_diagnostics` so the `read_lints` tool can
-/// produce the same human-readable shape.
 pub(crate) fn format_diagnostics_pub(diagnostics: &[Value]) -> String {
     format_diagnostics(diagnostics)
 }
 
-/// Public re-export of `detect_project_root` for the `read_lints` tool.
 pub(crate) fn detect_project_root_pub(file: &str) -> String {
     detect_project_root(file)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn formats_definition_links_and_locations() {
+        let r = json!([{
+            "targetUri": "file:///C:/p/src/a.rs",
+            "targetRange": {"start": {"line": 9, "character": 0}, "end": {"line": 12, "character": 1}},
+            "targetSelectionRange": {"start": {"line": 9, "character": 4}, "end": {"line": 9, "character": 8}}
+        }]);
+        assert_eq!(format_result("definition", &r), "Definitions:\n  C:/p/src/a.rs:10:4");
+    }
+
+    #[test]
+    fn rename_is_labelled_preview() {
+        let r = json!({"changes": {"file:///a.rs": [{}, {}], "file:///b.rs": [{}]}});
+        let out = format_rename(&r);
+        assert!(out.contains("PREVIEW"));
+        assert!(out.contains("3 edit(s) in 2 file(s)"));
+    }
+
+    #[test]
+    fn symbols_are_indented_by_nesting() {
+        let r = json!([{"name": "S", "kind": 23, "selectionRange": {"start": {"line": 0, "character": 0}},
+                        "children": [{"name": "f", "kind": 6, "selectionRange": {"start": {"line": 2, "character": 0}}}]}]);
+        let mut out = vec![];
+        flatten_symbols(&r, 0, &mut out);
+        assert_eq!(out, vec!["struct S  (line 1)", "  method f  (line 3)"]);
+    }
 }
