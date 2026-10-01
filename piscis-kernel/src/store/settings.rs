@@ -65,6 +65,18 @@ pub struct LlmProviderConfig {
     /// Max output tokens; 0 means inherit from global settings
     #[serde(default)]
     pub max_tokens: u32,
+    /// Sampling temperature; None = provider default.
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    /// Nucleus sampling top_p; None = provider default.
+    #[serde(default)]
+    pub top_p: Option<f32>,
+    /// Provider thinking mode; None/false = disabled.
+    #[serde(default)]
+    pub thinking: Option<bool>,
+    /// Per-model streaming override; None inherits global `enable_streaming`.
+    #[serde(default)]
+    pub stream: Option<bool>,
 }
 
 impl Default for LlmProviderConfig {
@@ -77,6 +89,10 @@ impl Default for LlmProviderConfig {
             api_key: String::new(),
             base_url: String::new(),
             max_tokens: 0,
+            temperature: None,
+            top_p: None,
+            thinking: None,
+            stream: None,
         }
     }
 }
@@ -610,6 +626,16 @@ pub struct Settings {
     #[serde(default)]
     pub enable_streaming: bool,
 
+    /// Sampling temperature for the active model; None = provider default.
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    /// Nucleus sampling top_p for the active model; None = provider default.
+    #[serde(default)]
+    pub top_p: Option<f32>,
+    /// Provider thinking mode for the active model; None/false = disabled.
+    #[serde(default)]
+    pub thinking: Option<bool>,
+
     // ── Overlay position ─────────────────────────────────────────────────────
     /// Last saved X position of the overlay window (physical pixels).
     /// None means "first launch — center relative to main window".
@@ -850,6 +876,9 @@ impl Default for Settings {
             vision_api_key: String::new(),
             vision_base_url: String::new(),
             enable_streaming: false,
+            temperature: None,
+            top_p: None,
+            thinking: None,
             overlay_x: None,
             overlay_y: None,
             allow_multiple_instances: false,
@@ -1014,6 +1043,14 @@ impl Settings {
 
     /// Look up a named LLM provider by its id.
     /// Returns `None` if no provider with that id exists.
+    pub fn client_options(&self) -> crate::llm::ClientOptions {
+        crate::llm::ClientOptions {
+            temperature: self.temperature,
+            top_p: self.top_p,
+            thinking: self.thinking,
+        }
+    }
+
     pub fn find_llm_provider(&self, id: &str) -> Option<&LlmProviderConfig> {
         self.llm_providers.iter().find(|p| p.id == id)
     }

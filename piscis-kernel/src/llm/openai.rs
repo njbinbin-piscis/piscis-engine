@@ -15,6 +15,7 @@ pub struct OpenAiClient {
     api_key: String,
     base_url: String,
     http: Client,
+    options: super::ClientOptions,
 }
 
 /// Returns true if the model name indicates vision/multimodal capability.
@@ -212,7 +213,13 @@ impl OpenAiClient {
             api_key: api_key.to_string(),
             base_url: base_url.trim_end_matches('/').to_string(),
             http,
+            options: super::ClientOptions::default(),
         }
+    }
+
+    pub fn with_options(mut self, options: super::ClientOptions) -> Self {
+        self.options = options;
+        self
     }
 
     /// Build the error for a non-2xx HTTP response and, in the same place,
@@ -853,6 +860,14 @@ impl OpenAiClient {
             body["tool_choice"] = json!("auto");
         }
 
+        if let Some(t) = self.options.temperature {
+            body["temperature"] = json!(t);
+        }
+        if let Some(p) = self.options.top_p {
+            body["top_p"] = json!(p);
+        }
+        let thinking_on = self.options.thinking == Some(true);
+
         if is_dashscope_qwen_endpoint(&self.base_url, &req.model) {
             // DashScope Qwen thinking mode requires assistant
             // `reasoning_content` to be passed back in every later request.
@@ -861,7 +876,7 @@ impl OpenAiClient {
             // enabled breaks resumed/IM conversations with a 400. Keep the
             // OpenAI-compatible payload stateless until reasoning traces are a
             // first-class persisted field.
-            body["enable_thinking"] = json!(false);
+            body["enable_thinking"] = json!(thinking_on);
         }
         if is_deepseek_thinking_model(&req.model) {
             // DeepSeek's newer thinking models default thinking on and require
@@ -869,7 +884,7 @@ impl OpenAiClient {
             // persist hidden reasoning traces yet, so disable thinking to keep
             // multi-turn IM/headless conversations compatible with our stored
             // OpenAI-style message history.
-            body["thinking"] = json!({ "type": "disabled" });
+            body["thinking"] = json!({ "type": if thinking_on { "enabled" } else { "disabled" } });
         }
 
         body
@@ -1143,6 +1158,22 @@ mod tests {
         let body = client.build_body(&request_for_model("deepseek-v4-flash"));
 
         assert_eq!(body["thinking"], json!({ "type": "disabled" }));
+    }
+
+    #[test]
+    fn client_options_apply_sampling_and_thinking() {
+        let client = OpenAiClient::new("test-key", "https://api.deepseek.com/v1").with_options(
+            crate::llm::ClientOptions {
+                temperature: Some(0.3),
+                top_p: Some(0.9),
+                thinking: Some(true),
+            },
+        );
+        let body = client.build_body(&request_for_model("deepseek-v4-flash"));
+
+        assert_eq!(body["temperature"], json!(0.3f32));
+        assert_eq!(body["top_p"], json!(0.9f32));
+        assert_eq!(body["thinking"], json!({ "type": "enabled" }));
     }
 
     #[test]

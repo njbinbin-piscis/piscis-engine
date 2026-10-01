@@ -1,13 +1,8 @@
 pub mod auto_select;
 pub mod claude;
-pub mod deepseek;
 pub mod error_class;
 pub mod json_repair;
-pub mod kimi;
-pub mod minimax;
 pub mod openai;
-pub mod qwen;
-pub mod zhipu;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -266,38 +261,75 @@ pub fn compute_context_budget(context_window: u32, max_tokens: u32) -> usize {
 }
 
 /// Build the appropriate client based on provider name
+/// Sampling / reasoning options applied to every request a client sends.
+/// `None` fields keep the provider's server-side default.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ClientOptions {
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
+    /// `Some(true)` enables provider "thinking" modes where supported
+    /// (OpenAI-compatible DeepSeek / Qwen). `None` / `Some(false)` keep
+    /// thinking disabled, which is required because reasoning traces are
+    /// not persisted in message history.
+    pub thinking: Option<bool>,
+}
+
+/// Default endpoint for OpenAI-compatible named providers.
+pub fn default_base_url(provider: &str) -> Option<&'static str> {
+    match provider {
+        "openai" | "custom" | "ollama" => Some("https://api.openai.com/v1"),
+        "deepseek" => Some("https://api.deepseek.com/v1"),
+        "qwen" | "tongyi" => Some("https://dashscope.aliyuncs.com/compatible-mode/v1"),
+        "minimax" => Some("https://api.minimax.io/v1"),
+        "zhipu" => Some("https://api.z.ai/api/paas/v4"),
+        "kimi" | "moonshot" => Some("https://api.moonshot.cn/v1"),
+        _ => None,
+    }
+}
+
 pub fn build_client(provider: &str, api_key: &str, base_url: Option<&str>) -> Box<dyn LlmClient> {
     build_client_with_timeout(provider, api_key, base_url, 120)
 }
 
-/// Build the appropriate client with a configurable read timeout (seconds).
+/// Build a client for the provider. A non-empty `base_url` overrides the
+/// provider's default endpoint for every provider.
 pub fn build_client_with_timeout(
     provider: &str,
     api_key: &str,
     base_url: Option<&str>,
     read_timeout_secs: u32,
 ) -> Box<dyn LlmClient> {
-    match provider {
-        "openai" | "custom" | "ollama" => Box::new(openai::OpenAiClient::with_timeout(
-            api_key,
-            base_url.unwrap_or("https://api.openai.com/v1"),
-            read_timeout_secs,
-        )),
-        "deepseek" => Box::new(deepseek::DeepSeekClient::with_timeout(
-            api_key,
-            read_timeout_secs,
-        )),
-        "qwen" | "tongyi" => Box::new(qwen::QwenClient::with_timeout(api_key, read_timeout_secs)),
-        "minimax" => Box::new(minimax::MiniMaxClient::with_timeout(
-            api_key,
-            read_timeout_secs,
-        )),
-        "zhipu" => Box::new(zhipu::ZhipuClient::with_timeout(api_key, read_timeout_secs)),
-        "kimi" | "moonshot" => Box::new(kimi::KimiClient::with_timeout(api_key, read_timeout_secs)),
-        _ => Box::new(claude::ClaudeClient::with_timeout(
-            api_key,
-            read_timeout_secs,
-        )),
+    build_client_with_options(
+        provider,
+        api_key,
+        base_url,
+        read_timeout_secs,
+        ClientOptions::default(),
+    )
+}
+
+pub fn build_client_with_options(
+    provider: &str,
+    api_key: &str,
+    base_url: Option<&str>,
+    read_timeout_secs: u32,
+    options: ClientOptions,
+) -> Box<dyn LlmClient> {
+    let base_url = base_url.map(str::trim).filter(|u| !u.is_empty());
+    match default_base_url(provider) {
+        Some(default) => Box::new(
+            openai::OpenAiClient::with_timeout(
+                api_key,
+                base_url.unwrap_or(default),
+                read_timeout_secs,
+            )
+            .with_options(options),
+        ),
+        None => Box::new(
+            claude::ClaudeClient::with_timeout(api_key, read_timeout_secs)
+                .with_base_url(base_url)
+                .with_options(options),
+        ),
     }
 }
 

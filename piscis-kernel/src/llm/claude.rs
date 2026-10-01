@@ -14,6 +14,8 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 pub struct ClaudeClient {
     api_key: String,
     http: Client,
+    messages_url: String,
+    options: super::ClientOptions,
 }
 
 impl ClaudeClient {
@@ -31,7 +33,32 @@ impl ClaudeClient {
         Self {
             api_key: api_key.to_string(),
             http,
+            messages_url: CLAUDE_API_URL.to_string(),
+            options: super::ClientOptions::default(),
         }
+    }
+
+    /// Override the endpoint root (e.g. `https://proxy.example.com` or
+    /// `https://proxy.example.com/v1`). Empty / `None` keeps the default.
+    pub fn with_base_url(mut self, base_url: Option<&str>) -> Self {
+        if let Some(u) = base_url
+            .map(|u| u.trim().trim_end_matches('/'))
+            .filter(|u| !u.is_empty())
+        {
+            self.messages_url = if u.ends_with("/messages") {
+                u.to_string()
+            } else if u.ends_with("/v1") {
+                format!("{u}/messages")
+            } else {
+                format!("{u}/v1/messages")
+            };
+        }
+        self
+    }
+
+    pub fn with_options(mut self, options: super::ClientOptions) -> Self {
+        self.options = options;
+        self
     }
 
     fn build_body(&self, req: &LlmRequest) -> Value {
@@ -90,6 +117,12 @@ impl ClaudeClient {
 
         if let Some(sys) = &req.system {
             body["system"] = json!(sys);
+        }
+        if let Some(t) = self.options.temperature {
+            body["temperature"] = json!(t);
+        }
+        if let Some(p) = self.options.top_p {
+            body["top_p"] = json!(p);
         }
 
         if !req.tools.is_empty() {
@@ -180,7 +213,7 @@ impl LlmClient for ClaudeClient {
 
         let response = self
             .http
-            .post(CLAUDE_API_URL)
+            .post(&self.messages_url)
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", ANTHROPIC_VERSION)
             .header("content-type", "application/json")
@@ -306,7 +339,7 @@ impl LlmClient for ClaudeClient {
 
         let response = self
             .http
-            .post(CLAUDE_API_URL)
+            .post(&self.messages_url)
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", ANTHROPIC_VERSION)
             .header("content-type", "application/json")
