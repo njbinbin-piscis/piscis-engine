@@ -38,6 +38,10 @@ pub enum ErrorClass {
     /// mid-stream disconnects). Should be retried with backoff on the same
     /// model, not switched away from.
     UpstreamTransient,
+    /// Provider thinking mode demanded a `reasoning_content` replay that the
+    /// client cannot supply. The client already retried with thinking off;
+    /// if this still surfaces, the user must pick a non-thinking model.
+    ReasoningReplayRequired,
     /// Doesn't match any known category.
     Unknown,
 }
@@ -53,6 +57,7 @@ impl ErrorClass {
             Self::RateLimited => "rate_limited",
             Self::AuthFailed => "auth_failed",
             Self::UpstreamTransient => "upstream_transient",
+            Self::ReasoningReplayRequired => "reasoning_replay_required",
             Self::Unknown => "unknown",
         }
     }
@@ -95,6 +100,10 @@ pub fn classify_error(msg: &str) -> ErrorClass {
 
     if lower.contains("tool_args_invalid") {
         return ErrorClass::ToolArgsInvalid;
+    }
+
+    if crate::llm::openai::is_reasoning_replay_error(msg) {
+        return ErrorClass::ReasoningReplayRequired;
     }
 
     if lower.contains("model_not_found")

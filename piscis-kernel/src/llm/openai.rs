@@ -111,6 +111,29 @@ fn is_dashscope_qwen_endpoint(base_url: &str, model: &str) -> bool {
     url.contains("dashscope.aliyuncs.com") && (model.contains("qwen") || model.contains("qvq"))
 }
 
+fn thinking_blocked_models() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static SET: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    SET.get_or_init(Default::default)
+}
+
+pub(crate) fn is_reasoning_replay_error(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    lower.contains("reasoning_content")
+        && (lower.contains("passed back") || lower.contains("must be") || lower.contains("missing"))
+}
+
+fn has_assistant_tool_calls(body: &Value) -> bool {
+    body["messages"].as_array().is_some_and(|msgs| {
+        msgs.iter().any(|m| {
+            m["role"] == "assistant"
+                && m.get("tool_calls")
+                    .and_then(|t| t.as_array())
+                    .is_some_and(|t| !t.is_empty())
+        })
+    })
+}
+
 fn is_deepseek_thinking_model(model: &str) -> bool {
     let model = model.to_lowercase();
     // Also covers gateway-prefixed names (e.g. `deepseek-ai/DeepSeek-R1`) and
@@ -220,6 +243,62 @@ impl OpenAiClient {
     pub fn with_options(mut self, options: super::ClientOptions) -> Self {
         self.options = options;
         self
+    }
+
+    fn thinking_block_key(&self, model: &str) -> String {
+        format!("{}|{}", self.base_url, model.to_lowercase())
+    }
+
+    fn is_thinking_blocked(&self, model: &str) -> bool {
+        thinking_blocked_models()
+            .lock()
+            .map(|set| set.contains(&self.thinking_block_key(model)))
+            .unwrap_or(false)
+    }
+
+    fn block_thinking(&self, model: &str) {
+        if let Ok(mut set) = thinking_blocked_models().lock() {
+            set.insert(self.thinking_block_key(model));
+        }
+    }
+
+    /// POST `/chat/completions`. If the provider rejects the request because
+    /// thinking mode wants a `reasoning_content` replay, thinking is turned
+    /// off for this endpoint+model (process-wide) and the request is resent
+    /// once — the model cannot fix this itself, the history shape is ours.
+    async fn post_chat(&self, req: &LlmRequest) -> Result<reqwest::Response> {
+        let url = format!("{}/chat/completions", self.base_url);
+        let mut downgraded = false;
+        loop {
+            let body = self.build_body(req);
+            let response = self
+                .http
+                .post(&url)
+                .bearer_auth(&self.api_key)
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| Self::request_send_error(&url, e))?;
+            if response.status().is_success() {
+                return Ok(response);
+            }
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            Self::log_400_diagnostic(status, &body, &req.model, &url, &text);
+            if !downgraded
+                && status == reqwest::StatusCode::BAD_REQUEST
+                && is_reasoning_replay_error(&text)
+            {
+                tracing::warn!(
+                    model = %req.model,
+                    "provider requires reasoning_content replay; disabling thinking and retrying once"
+                );
+                self.block_thinking(&req.model);
+                downgraded = true;
+                continue;
+            }
+            return Err(Self::api_error(&req.model, status, &text));
+        }
     }
 
     /// Build the error for a non-2xx HTTP response and, in the same place,
@@ -866,7 +945,17 @@ impl OpenAiClient {
         if let Some(p) = self.options.top_p {
             body["top_p"] = json!(p);
         }
-        let thinking_on = self.options.thinking == Some(true);
+        let thinking_blocked = self.is_thinking_blocked(&req.model);
+        // Reasoning traces are not persisted, so once the history holds an
+        // assistant tool call the provider would demand a `reasoning_content`
+        // we cannot replay. Thinking stays usable only before that point.
+        let thinking_on = self.options.thinking == Some(true)
+            && !thinking_blocked
+            && !has_assistant_tool_calls(&body);
+
+        if thinking_blocked && !is_dashscope_qwen_endpoint(&self.base_url, &req.model) {
+            body["thinking"] = json!({ "type": "disabled" });
+        }
 
         if is_dashscope_qwen_endpoint(&self.base_url, &req.model) {
             // DashScope Qwen thinking mode requires assistant
@@ -896,24 +985,7 @@ impl LlmClient for OpenAiClient {
     async fn stream(&self, req: LlmRequest, tx: Sender<LlmChunk>) -> Result<()> {
         let mut req_stream = req.clone();
         req_stream.stream = true;
-        let body = self.build_body(&req_stream);
-
-        let url = format!("{}/chat/completions", self.base_url);
-        let response = self
-            .http
-            .post(&url)
-            .bearer_auth(&self.api_key)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| Self::request_send_error(&url, e))?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().await.unwrap_or_default();
-            Self::log_400_diagnostic(status, &body, &req_stream.model, &url, &text);
-            return Err(Self::api_error(&req_stream.model, status, &text));
-        }
+        let response = self.post_chat(&req_stream).await?;
 
         let mut stream = response.bytes_stream();
         let mut buffer = String::new();
@@ -1035,24 +1107,7 @@ impl LlmClient for OpenAiClient {
     async fn complete(&self, req: LlmRequest) -> Result<LlmResponse> {
         let mut req_no_stream = req.clone();
         req_no_stream.stream = false;
-        let body = self.build_body(&req_no_stream);
-
-        let url = format!("{}/chat/completions", self.base_url);
-        let response = self
-            .http
-            .post(&url)
-            .bearer_auth(&self.api_key)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| Self::request_send_error(&url, e))?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().await.unwrap_or_default();
-            Self::log_400_diagnostic(status, &body, &req_no_stream.model, &url, &text);
-            return Err(Self::api_error(&req_no_stream.model, status, &text));
-        }
+        let response = self.post_chat(&req_no_stream).await?;
 
         let body = response.bytes().await?;
         let val: Value = serde_json::from_slice(&body).map_err(|e| {
@@ -1182,6 +1237,63 @@ mod tests {
         let body = client.build_body(&request_for_model("deepseek-chat"));
 
         assert!(body.get("thinking").is_none());
+    }
+
+    fn request_with_tool_history(model: &str) -> LlmRequest {
+        let mut req = request_for_model(model);
+        req.messages = vec![
+            LlmMessage {
+                role: "user".into(),
+                content: MessageContent::text("hi"),
+            },
+            LlmMessage {
+                role: "assistant".into(),
+                content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                    id: "call_1".into(),
+                    name: "file_read".into(),
+                    input: json!({"path": "a.txt"}),
+                }]),
+            },
+            LlmMessage {
+                role: "user".into(),
+                content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                    tool_use_id: "call_1".into(),
+                    content: "ok".into(),
+                    is_error: false,
+                }]),
+            },
+        ];
+        req
+    }
+
+    #[test]
+    fn thinking_disabled_once_history_has_tool_calls() {
+        let client = OpenAiClient::new("test-key", "https://api.deepseek.com/v1").with_options(
+            crate::llm::ClientOptions {
+                thinking: Some(true),
+                ..Default::default()
+            },
+        );
+        let body = client.build_body(&request_with_tool_history("deepseek-v4-flash"));
+        assert_eq!(body["thinking"], json!({ "type": "disabled" }));
+    }
+
+    #[test]
+    fn blocked_model_gets_explicit_thinking_disabled() {
+        let client = OpenAiClient::new("test-key", "https://gw.example.com/v1");
+        client.block_thinking("kimi-k2-thinking-blocktest");
+        let body = client.build_body(&request_for_model("kimi-k2-thinking-blocktest"));
+        assert_eq!(body["thinking"], json!({ "type": "disabled" }));
+        let other = client.build_body(&request_for_model("gpt-4o"));
+        assert!(other.get("thinking").is_none());
+    }
+
+    #[test]
+    fn detects_reasoning_replay_error() {
+        assert!(is_reasoning_replay_error(
+            r#"{"error":{"message":"The `reasoning_content` in the thinking mode must be passed back to the API."}}"#
+        ));
+        assert!(!is_reasoning_replay_error("invalid api key"));
     }
 
     #[test]
