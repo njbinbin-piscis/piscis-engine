@@ -441,6 +441,13 @@ pub struct Session {
     pub allow_outside_workspace: Option<bool>,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ModelUsageRow {
+    pub model: String,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionContextState {
     pub session_id: String,
@@ -808,6 +815,14 @@ impl Database {
                 last_compacted_at TEXT
             );
 
+            CREATE TABLE IF NOT EXISTS model_usage (
+                session_id TEXT NOT NULL,
+                model TEXT NOT NULL,
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (session_id, model)
+            );
+
             CREATE TABLE IF NOT EXISTS messages (
                 id TEXT PRIMARY KEY,
                 session_id TEXT NOT NULL,
@@ -850,6 +865,26 @@ impl Database {
                 source_session_id TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS background_tasks (
+                bg_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                label TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'running',
+                exit_code INTEGER,
+                last_kind TEXT NOT NULL DEFAULT '',
+                updated_unix_ms INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS pending_bg_continuations (
+                bg_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                prompt TEXT NOT NULL,
+                display_prompt TEXT NOT NULL,
+                session_source TEXT,
+                prefer_zh INTEGER NOT NULL DEFAULT 0,
+                created_unix_ms INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS scheduled_tasks (
@@ -1945,6 +1980,46 @@ impl Database {
         Ok(rows.next().transpose()?)
     }
 
+    /// Accumulate token usage for one (session, model) pair.
+    pub fn add_model_usage(
+        &self,
+        session_id: &str,
+        model: &str,
+        input_delta: u32,
+        output_delta: u32,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO model_usage (session_id, model, input_tokens, output_tokens)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(session_id, model) DO UPDATE SET
+                 input_tokens = input_tokens + excluded.input_tokens,
+                 output_tokens = output_tokens + excluded.output_tokens",
+            params![session_id, model, i64::from(input_delta), i64::from(output_delta)],
+        )?;
+        Ok(())
+    }
+
+    /// Per-model usage for a single session.
+    pub fn session_model_usage(&self, session_id: &str) -> Result<Vec<ModelUsageRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT model, input_tokens, output_tokens FROM model_usage WHERE session_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![session_id], |r| {
+            Ok(ModelUsageRow { model: r.get(0)?, input_tokens: r.get(1)?, output_tokens: r.get(2)? })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Per-model usage summed over every session in this (project-local) database.
+    pub fn project_model_usage(&self) -> Result<Vec<ModelUsageRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT model, SUM(input_tokens), SUM(output_tokens) FROM model_usage GROUP BY model",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(ModelUsageRow { model: r.get(0)?, input_tokens: r.get(1)?, output_tokens: r.get(2)? })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
     pub fn update_session_usage_totals(
         &self,
         session_id: &str,
@@ -3582,6 +3657,107 @@ impl Database {
     // ------------------------------------------------------------------
     // Fish instances
     // ------------------------------------------------------------------
+
+    // ------------------------------------------------------------------
+    // Background tasks (host-managed long-running processes)
+    // ------------------------------------------------------------------
+
+    /// Record (or update) a background task's latest known state. Rows are
+    /// written on ready/terminal events; `running` rows that survive an app
+    /// restart are reconciled to `interrupted` by the host.
+    pub fn upsert_background_task(
+        &self,
+        bg_id: &str,
+        session_id: &str,
+        label: &str,
+        status: &str,
+        exit_code: Option<i64>,
+        last_kind: &str,
+        updated_unix_ms: u64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO background_tasks (bg_id, session_id, label, status, exit_code, last_kind, updated_unix_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(bg_id) DO UPDATE SET session_id=excluded.session_id, label=excluded.label,
+               status=excluded.status, exit_code=excluded.exit_code, last_kind=excluded.last_kind,
+               updated_unix_ms=excluded.updated_unix_ms",
+            rusqlite::params![bg_id, session_id, label, status, exit_code, last_kind, updated_unix_ms as i64],
+        )?;
+        Ok(())
+    }
+
+    /// bg_ids still marked `running` (candidates for interrupted reconcile).
+    pub fn list_running_background_task_ids(&self) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT bg_id FROM background_tasks WHERE status = 'running'")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    pub fn mark_background_task_status(&self, bg_id: &str, status: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE background_tasks SET status = ?2 WHERE bg_id = ?1",
+            rusqlite::params![bg_id, status],
+        )?;
+        Ok(())
+    }
+
+    pub fn upsert_pending_bg_continuation(
+        &self,
+        bg_id: &str,
+        session_id: &str,
+        prompt: &str,
+        display_prompt: &str,
+        session_source: Option<&str>,
+        prefer_zh: bool,
+        created_unix_ms: u64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO pending_bg_continuations (bg_id, session_id, prompt, display_prompt, session_source, prefer_zh, created_unix_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(bg_id) DO UPDATE SET prompt=excluded.prompt, display_prompt=excluded.display_prompt,
+               session_source=excluded.session_source, prefer_zh=excluded.prefer_zh",
+            rusqlite::params![bg_id, session_id, prompt, display_prompt, session_source, prefer_zh as i64, created_unix_ms as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_pending_bg_continuations(
+        &self,
+    ) -> Result<Vec<(String, String, String, String, Option<String>, bool)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT bg_id, session_id, prompt, display_prompt, session_source, prefer_zh \
+             FROM pending_bg_continuations ORDER BY created_unix_ms ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, i64>(5)? != 0,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    pub fn delete_pending_bg_continuation(&self, bg_id: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM pending_bg_continuations WHERE bg_id = ?1",
+            rusqlite::params![bg_id],
+        )?;
+        Ok(())
+    }
 
     // ------------------------------------------------------------------
     // Task States
@@ -6390,6 +6566,17 @@ mod tests {
         assert_eq!(updated.rolling_summary, "summary body");
         assert_eq!(updated.rolling_summary_version, 2);
         assert!(updated.last_compacted_at.is_some());
+
+        db.add_model_usage(&session.id, "m1", 100, 10).expect("usage m1");
+        db.add_model_usage(&session.id, "m1", 50, 5).expect("usage m1 again");
+        db.add_model_usage(&session.id, "m2", 7, 3).expect("usage m2");
+        let mut rows = db.session_model_usage(&session.id).expect("session usage");
+        rows.sort_by(|a, b| a.model.cmp(&b.model));
+        assert_eq!(rows.len(), 2);
+        assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (150, 15));
+        let mut all = db.project_model_usage().expect("project usage");
+        all.sort_by(|a, b| a.model.cmp(&b.model));
+        assert_eq!((all[1].model.as_str(), all[1].input_tokens), ("m2", 7));
     }
 
     #[test]

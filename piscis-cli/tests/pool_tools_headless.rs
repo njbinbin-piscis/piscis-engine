@@ -46,6 +46,7 @@ fn build_handle() -> ToolRegistryHandle {
         pool_event_sink: Some(host.pool_event_sink()),
         subagent_runtime: None,
         coordinator_config: Default::default(),
+        background_registry: None,
     };
     let mut handle = new_tool_registry_handle();
     register_neutral_tools(&mut handle, &cfg);
@@ -93,6 +94,7 @@ fn pool_tools_are_skipped_when_sink_missing() {
         pool_event_sink: None,
         subagent_runtime: None,
         coordinator_config: Default::default(),
+        background_registry: None,
     };
     let mut handle = new_tool_registry_handle();
     register_neutral_tools(&mut handle, &cfg);

@@ -10,11 +10,13 @@
 //! into the kernel via the [`piscis_core::host`] traits.
 
 pub mod agent;
+pub mod background;
 pub mod context;
 pub mod headless;
 pub mod llm;
 pub mod memory;
 pub mod notify;
+pub mod path_text;
 pub mod policy;
 pub mod pool;
 pub mod proc;
@@ -23,6 +25,7 @@ pub mod scheduler;
 pub mod security;
 pub mod store;
 pub mod tools;
+pub mod tool_recovery;
 
 // Re-export for downstream crates that want `piscis_kernel::core::...`.
 pub use piscis_core as core;

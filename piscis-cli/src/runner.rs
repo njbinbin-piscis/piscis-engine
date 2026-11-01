@@ -121,6 +121,7 @@ fn run_piscis_once_with_host(
         pool_event_sink: Some(host.pool_event_sink()),
         subagent_runtime: None,
         coordinator_config: Default::default(),
+        background_registry: None,
     };
     piscis_kernel::tools::register_neutral_tools(&mut handle, &neutral_cfg);
     host.host_tools().register(&mut handle);
@@ -205,6 +206,7 @@ pub fn run_pool_once(request: HeadlessCliRequest) -> Result<HeadlessCliResponse,
         pool_event_sink: Some(host.pool_event_sink()),
         subagent_runtime: Some(subagent.clone()),
         coordinator_config: coordinator_config.clone(),
+        background_registry: None,
     };
     piscis_kernel::tools::register_neutral_tools(&mut handle, &neutral_cfg);
     host.host_tools().register(&mut handle);

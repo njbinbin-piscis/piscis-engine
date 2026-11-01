@@ -30,9 +30,73 @@ use std::sync::{
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, info, warn};
 
+/// Invocation completion is separate from owned subprocess cleanup. A normally
+/// returned error ends the invocation; dropped/aborted futures remain unconfirmed.
+async fn call_with_completion(
+    tool: &dyn super::tool::Tool,
+    input: serde_json::Value,
+    ctx: &ToolContext,
+) -> Result<super::tool::ToolResult> {
+    let receipt = ctx
+        .owned_completion()
+        .register()
+        .map_err(anyhow::Error::msg)?;
+    let result = tool.call(input, ctx).await;
+    receipt.complete(Ok(()));
+    result.map(|mut r| {
+        if let std::borrow::Cow::Owned(clean) = crate::tools::output::sanitize_tool_text(&r.content) {
+            r.content = clean;
+        }
+        r
+    })
+}
+
 const DEFAULT_MAX_ITERATIONS: usize = 50;
 const TOOL_TIMEOUT_SECS: u64 = 120;
+/// After a cancel request, a running tool gets this long to finish its own teardown
+/// (for example a sandboxed shell terminating its Job Object) before its future is dropped.
+const CANCEL_GRACE_SECS: u64 = 8;
+/// Slack over a tool's own timeout so it can finish its timeout handling
+/// (e.g. moving a shell command to the background) before the loop gives up.
+const TOOL_TIMEOUT_SLACK_SECS: u64 = 30;
+/// Upper bound for tool-requested timeouts.
+const TOOL_TIMEOUT_MAX_SECS: u64 = 3600;
+
+/// Loop-level timeout for one tool call: the default, or longer when the
+/// call asks for its own (`timeout` / `timeout_secs` seconds, `timeout_ms`).
+fn tool_timeout_for(input: &serde_json::Value) -> u64 {
+    let own = input["timeout"]
+        .as_u64()
+        .or_else(|| input["timeout_secs"].as_u64())
+        .or_else(|| input["timeout_ms"].as_u64().map(|ms| ms.div_ceil(1000)));
+    match own {
+        Some(s) => (s.min(TOOL_TIMEOUT_MAX_SECS) + TOOL_TIMEOUT_SLACK_SECS).max(TOOL_TIMEOUT_SECS),
+        None => TOOL_TIMEOUT_SECS + TOOL_TIMEOUT_SLACK_SECS,
+    }
+}
 const READ_TOOL_MAX_CONCURRENCY: usize = 4;
+// Logical primary-agent calls only: auxiliary compaction/vision and client wire
+// retries remain outside this budget. Correction/overflow share one iteration window.
+const MAX_SAME_MODEL_ATTEMPTS: u32 = 5;
+const MAX_MODEL_CANDIDATES: usize = 4;
+const MAX_MAIN_CALLS_PER_ITERATION: u32 = 12;
+
+fn retry_backoff(attempt: u32) -> std::time::Duration {
+    std::time::Duration::from_secs(1u64.checked_shl(attempt.min(3)).unwrap_or(8).min(8))
+}
+
+fn bounded_model_candidates(primary: String, fallbacks: &[String]) -> Vec<String> {
+    let mut candidates = vec![primary];
+    for fallback in fallbacks {
+        if candidates.len() == MAX_MODEL_CANDIDATES {
+            break;
+        }
+        if !candidates.contains(fallback) {
+            candidates.push(fallback.clone());
+        }
+    }
+    candidates
+}
 
 // ── Runtime guard thresholds ─────────────────────────────────────────────────
 // Purpose: ONLY prevent true infinite loops / dead loops where the agent is
@@ -275,6 +339,10 @@ struct ToolCallRecord {
     name: String,
     input_hash: u64,
     result_hash: u64,
+    /// Result hash with volatile parts (digits, recovery trailer) removed, so
+    /// reruns that differ only in timings still compare equal.
+    #[serde(default)]
+    norm_hash: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -297,16 +365,58 @@ struct LoopDetectorState {
     /// the moment any substantive action runs (click, type, hotkey,
     /// drag, file edit, shell command, …).
     consecutive_vision_only_turns: usize,
+    /// Warnings already issued per call hash; ignored warnings escalate to a block.
+    warned: HashMap<u64, usize>,
 }
 
 impl LoopDetectorState {
+    /// Rebuild the window from persisted history so a new turn does not start
+    /// with a clean slate while the model is still repeating itself.
+    fn seed_from_messages(&mut self, messages: &[LlmMessage]) {
+        let mut calls: HashMap<String, (String, serde_json::Value)> = HashMap::new();
+        for message in messages {
+            let MessageContent::Blocks(blocks) = &message.content else {
+                continue;
+            };
+            for block in blocks {
+                match block {
+                    ContentBlock::ToolUse { id, name, input } => {
+                        calls.insert(id.clone(), (name.clone(), input.clone()));
+                    }
+                    ContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                        ..
+                    } => {
+                        if let Some((name, input)) = calls.get(tool_use_id) {
+                            self.record(
+                                name,
+                                input,
+                                stable_hash_result(content),
+                                stable_hash_normalized(content),
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
     /// Record a completed tool call with its result hash.
-    fn record(&mut self, name: &str, input: &serde_json::Value, result_hash: u64) {
+    fn record(
+        &mut self,
+        name: &str,
+        input: &serde_json::Value,
+        result_hash: u64,
+        norm_hash: u64,
+    ) {
         let input_hash = stable_hash_input(name, input);
         self.history.push(ToolCallRecord {
             name: name.to_string(),
             input_hash,
             result_hash,
+            norm_hash,
         });
         if self.history.len() > TOOL_CALL_HISTORY_SIZE {
             self.history.remove(0);
@@ -323,6 +433,34 @@ impl LoopDetectorState {
     /// pattern the vision-loop detector is trying to encourage, so it
     /// should reset the consecutive-vision streak.
     fn detect(
+        &mut self,
+        pending_name: &str,
+        pending_input: &serde_json::Value,
+        batch: &[(String, String, serde_json::Value)],
+    ) -> LoopDetectionResult {
+        let mut result = self.detect_inner(pending_name, pending_input, batch);
+        if result.level == LoopLevel::Warning
+            && !matches!(result.detector, Some(LoopDetector::VisionLoop))
+        {
+            let hash = stable_hash_input(pending_name, pending_input);
+            let n = self.warned.entry(hash).or_insert(0);
+            *n += 1;
+            if *n > 3 {
+                result = LoopDetectionResult {
+                    level: LoopLevel::Critical,
+                    detector: result.detector,
+                    count: result.count,
+                    message: format!(
+                        "Tool '{}' was blocked: repeated warnings about this identical call were ignored. Do not retry it. Tell the user what is failing and ask how to proceed.",
+                        pending_name
+                    ),
+                };
+            }
+        }
+        result
+    }
+
+    fn detect_inner(
         &mut self,
         pending_name: &str,
         pending_input: &serde_json::Value,
@@ -485,6 +623,71 @@ impl LoopDetectorState {
             }
         } else {
             self.consecutive_vision_only_turns = 0;
+        }
+
+        // 3.8. Same call, equivalent outcome, again and again (not necessarily
+        // consecutive: edit-then-rerun cycles that never change the result).
+        // Only command-running tools: repeated reads of the same file
+        // legitimately return the same content.
+        let runs_commands = pending_name == "code_run";
+        if runs_commands {
+            if let Some(last) = self
+                .history
+                .iter()
+                .rev()
+                .find(|r| r.name == pending_name && r.input_hash == pending_hash)
+            {
+                let same = self
+                    .history
+                    .iter()
+                    .filter(|r| {
+                        r.name == pending_name
+                            && r.input_hash == pending_hash
+                            && r.norm_hash == last.norm_hash
+                    })
+                    .count();
+                if same >= 8 {
+                    return LoopDetectionResult {
+                        level: LoopLevel::Critical,
+                        detector: Some(LoopDetector::GlobalCircuitBreaker),
+                        count: same,
+                        message: format!(
+                            "Tool '{}' was run {} times with the same outcome and no progress. Stop retrying: report to the user what is failing and ask for direction.",
+                            pending_name, same
+                        ),
+                    };
+                }
+                if same >= 4 {
+                    return LoopDetectionResult {
+                        level: LoopLevel::Warning,
+                        detector: Some(LoopDetector::GenericRepeat),
+                        count: same,
+                        message: format!(
+                            "Tool '{}' has produced the same outcome {} times. Rerunning without a real change will not help; change the approach or report the blocker.",
+                            pending_name, same
+                        ),
+                    };
+                }
+            }
+        }
+
+        // 3.9. Early nudge: the same call several rounds in a row. The generic
+        // thresholds below are deliberately high; this one only asks the model
+        // to change approach before some providers reject the repetition.
+        if !KNOWN_POLL_TOOLS.contains(&pending_name) {
+            let streak = self.count_same_tool_streak(pending_name, pending_hash);
+            if streak >= 2 {
+                return LoopDetectionResult {
+                    level: LoopLevel::Warning,
+                    detector: Some(LoopDetector::GenericRepeat),
+                    count: streak + 1,
+                    message: format!(
+                        "Tool '{}' was called with identical arguments {} times in a row. Change the arguments or approach, or report what is blocking you.",
+                        pending_name,
+                        streak + 1
+                    ),
+                };
+            }
         }
 
         // 4. Generic repeat: same tool+input appearing too many times
@@ -658,6 +861,18 @@ fn same_tool_family(a: &str, b: &str) -> bool {
 }
 
 /// Compute a stable hash of a single tool result content string.
+/// Hash of a tool result without volatile parts: everything from the recovery
+/// trailer on (it carries a unique operation id) and all ASCII digits (timings,
+/// counters) are ignored.
+fn stable_hash_normalized(content: &str) -> u64 {
+    let body = content.split("[recovery_v1]").next().unwrap_or(content);
+    let mut hasher = DefaultHasher::new();
+    for ch in body.chars().filter(|c| !c.is_ascii_digit()) {
+        ch.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
 fn stable_hash_result(content: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
     content.hash(&mut hasher);
@@ -1422,7 +1637,79 @@ pub fn build_request_view_messages(
         let configured_limit = max_tool_result_tokens as usize;
         compact_trim_tool_results(&mut out, dynamic_limit.min(configured_limit));
     }
-    out
+    collapse_repeated_tool_rounds(out)
+}
+
+/// One assistant tool round (a single tool call plus its single result) as
+/// two adjacent messages, used to find identical consecutive rounds.
+fn single_tool_round(messages: &[LlmMessage], i: usize) -> Option<(String, String)> {
+    let (a, b) = (messages.get(i)?, messages.get(i + 1)?);
+    if a.role != "assistant" || b.role != "user" {
+        return None;
+    }
+    let (MessageContent::Blocks(ab), MessageContent::Blocks(bb)) = (&a.content, &b.content) else {
+        return None;
+    };
+    let mut uses = ab.iter().filter_map(|x| match x {
+        ContentBlock::ToolUse { id, name, input } => Some((id, name, input)),
+        _ => None,
+    });
+    let (id, name, input) = uses.next()?;
+    if uses.next().is_some() {
+        return None;
+    }
+    let mut results = bb.iter().filter_map(|x| match x {
+        ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id),
+        _ => None,
+    });
+    if results.next()? != id || results.next().is_some() {
+        return None;
+    }
+    Some((name.clone(), input.to_string()))
+}
+
+/// Some providers (e.g. Qwen on DashScope) reject a request with HTTP 400 when
+/// the history holds the same tool call (same name and arguments) in several
+/// consecutive rounds. Keep only the last round of every such run and note the
+/// repetition in its result, so the model still learns it was repeating
+/// itself. Operates on the request view only; stored history is untouched.
+pub fn collapse_repeated_tool_rounds(messages: Vec<LlmMessage>) -> Vec<LlmMessage> {
+    let mut drop = vec![false; messages.len()];
+    let mut notes: HashMap<usize, usize> = HashMap::new();
+    let mut i = 0;
+    while i < messages.len() {
+        let Some(sig) = single_tool_round(&messages, i) else {
+            i += 1;
+            continue;
+        };
+        let mut j = i + 2;
+        while single_tool_round(&messages, j).as_ref() == Some(&sig) {
+            j += 2;
+        }
+        let rounds = (j - i) / 2;
+        if rounds >= 2 {
+            drop[i..j - 2].fill(true);
+            notes.insert(j - 1, rounds);
+        }
+        i = j;
+    }
+    messages
+        .into_iter()
+        .enumerate()
+        .filter(|(idx, _)| !drop[*idx])
+        .map(|(idx, mut m)| {
+            if let (Some(n), MessageContent::Blocks(blocks)) = (notes.get(&idx), &mut m.content) {
+                for b in blocks.iter_mut() {
+                    if let ContentBlock::ToolResult { content, .. } = b {
+                        content.push_str(&format!(
+                            "\n[Note: this identical call was made {n} times in a row; earlier repeats were omitted. Change the arguments or approach instead of repeating it.]"
+                        ));
+                    }
+                }
+            }
+            m
+        })
+        .collect()
 }
 
 /// Rebuild rule-based minimal receipts for complete tool exchanges already in
@@ -1949,19 +2236,6 @@ fn is_context_overflow_error(msg: &str) -> bool {
         || lower.contains("reduce the length")
 }
 
-/// Returns true if the error indicates the model is permanently unavailable
-/// (or provider-side rate limited) and a fallback model should be tried
-/// instead.
-/// Note: "overloaded" is intentionally excluded — it is transient and should
-/// be retried with exponential backoff on the same model, not switched away from.
-///
-/// Delegates to [`crate::llm::error_class::classify_error`] so the fallback
-/// decision, `AgentEvent::Error.code`, and downstream UI/log consumers all
-/// agree on the same classification (see docs/plans OpenAI 兼容链路鲁棒性).
-fn is_fallback_eligible_error(msg: &str) -> bool {
-    crate::llm::error_class::classify_error(msg).is_fallback_eligible()
-}
-
 /// Unified entry point for the per-iteration LLM call. When
 /// `enable_streaming` is false, delegates to `LlmClient::complete` (the
 /// historical single-response path). When true, drives `LlmClient::stream`,
@@ -2365,35 +2639,56 @@ impl AgentLoop {
                             }
                         }
                     };
-                    tokio::select! {
+                    // Owned-completion tools (shell, code_run) observe `ctx.cancel` themselves and
+                    // terminate their own process tree. Dropping the future at the first watcher poll
+                    // raced that teardown and misreported the outcome as interrupted. Instead, after
+                    // a cancel request the tool gets a bounded grace period; only then is it dropped.
+                    let tool_timeout_secs = if tool.manages_own_timeout() {
+                        TOOL_TIMEOUT_MAX_SECS
+                    } else {
+                        tool_timeout_for(&input)
+                    };
+                    let mut tool_future = Box::pin(tokio::time::timeout(
+                        std::time::Duration::from_secs(tool_timeout_secs),
+                        call_with_completion(tool, input.clone(), &tool_ctx),
+                    ));
+                    let outcome = tokio::select! {
                         biased;
-                        res = tokio::time::timeout(
-                            std::time::Duration::from_secs(TOOL_TIMEOUT_SECS),
-                            tool.call(input.clone(), &tool_ctx),
-                        ) => {
-                            match res {
-                                Ok(Ok(r)) => r,
-                                Ok(Err(e)) => {
-                                    let err_msg = e.to_string();
-                                    warn!("Tool '{}' error: {} | input: {}", name, err_msg, input_hint);
-                                    schema_correction_envelope = maybe_schema_correction_envelope(
-                                        &self.registry,
-                                        name,
-                                        &err_msg,
-                                    );
-                                    let friendly = friendly_tool_error(name, &err_msg);
-                                    super::tool::ToolResult::err(friendly)
-                                }
-                                Err(_) => {
-                                    warn!("Tool '{}' timed out after {}s", name, TOOL_TIMEOUT_SECS);
-                                    super::tool::ToolResult::err(format!(
-                                        "工具 '{}' 执行超时（{}秒）。可能原因：命令阻塞、网络超时或进程挂起。请尝试简化命令或分步执行。",
-                                        name, TOOL_TIMEOUT_SECS
-                                    ))
-                                }
-                            }
-                        }
+                        res = &mut tool_future => Some(res),
                         _ = cancel_watcher => {
+                            warn!(
+                                "Tool '{}' cancel requested; allowing {}s for its own teardown",
+                                name, CANCEL_GRACE_SECS
+                            );
+                            tokio::time::timeout(
+                                std::time::Duration::from_secs(CANCEL_GRACE_SECS),
+                                &mut tool_future,
+                            )
+                            .await
+                            .ok()
+                        }
+                    };
+                    match outcome {
+                        Some(Ok(Ok(r))) => r,
+                        Some(Ok(Err(e))) => {
+                            let err_msg = e.to_string();
+                            warn!("Tool '{}' error: {} | input: {}", name, err_msg, input_hint);
+                            schema_correction_envelope = maybe_schema_correction_envelope(
+                                &self.registry,
+                                name,
+                                &err_msg,
+                            );
+                            let friendly = friendly_tool_error(name, &err_msg);
+                            super::tool::ToolResult::err(friendly)
+                        }
+                        Some(Err(_)) => {
+                            warn!("Tool '{}' timed out after {}s", name, tool_timeout_secs);
+                            super::tool::ToolResult::err(format!(
+                                "工具 '{}' 执行超时（{}秒）。可能原因：命令阻塞、网络超时或进程挂起。请尝试简化命令或分步执行。",
+                                name, tool_timeout_secs
+                            ))
+                        }
+                        None => {
                             warn!("Tool '{}' interrupted by user cancel", name);
                             super::tool::ToolResult::err("已被用户取消".to_string())
                         }
@@ -2914,9 +3209,13 @@ impl AgentLoop {
 
         let max_iterations = ctx.max_iterations.unwrap_or(DEFAULT_MAX_ITERATIONS as u32) as usize;
         let mut loop_detector = LoopDetectorState {
-            history: restored_loop_history.unwrap_or_default(),
+            history: restored_loop_history.clone().unwrap_or_default(),
             consecutive_vision_only_turns: 0,
+            warned: HashMap::new(),
         };
+        if restored_loop_history.is_none() {
+            loop_detector.seed_from_messages(&messages);
+        }
         let mut rolling_summary = String::new();
         let mut seen_notifications: HashSet<String> =
             restored_seen_notifications.unwrap_or_default();
@@ -3156,9 +3455,12 @@ impl AgentLoop {
             info!("calling LLM: model={}", self.model);
             let mut cancelled_partial_text: Option<String> = None;
             // Caps the "please resend the full tool call JSON" corrective
-            // retry (P0-2) to at most one attempt per iteration, so a model
-            // that keeps truncating its output cannot loop forever.
-            let mut tool_args_correction_attempted = false;
+            // retry (P0-2) per iteration, so a model that keeps truncating
+            // its output cannot loop forever.
+            let mut tool_args_corrections = 0u8;
+            let mut context_overflow_attempted = false;
+            let mut main_calls_remaining = MAX_MAIN_CALLS_PER_ITERATION;
+            let mut usage_model = self.model.clone();
             let response = 'attempt_with_correction: loop {
                 // Loop-strategy next-turn hint may override the primary model
                 // for this iteration (default: no override).
@@ -3175,13 +3477,11 @@ impl AgentLoop {
                             .model
                     })
                     .unwrap_or_else(|| self.model.clone());
-                let models_to_try: Vec<String> = std::iter::once(primary_model.clone())
-                    .chain(self.fallback_models.iter().cloned())
-                    .collect();
+                let models_to_try =
+                    bounded_model_candidates(primary_model.clone(), &self.fallback_models);
                 let mut last_err: Option<anyhow::Error> = None;
                 let mut resp: Option<crate::llm::LlmResponse> = None;
                 let mut succeeded_model: Option<String> = None;
-                let mut context_overflow_attempted = false;
                 let mut model_index = 0usize;
 
                 'model_loop: while let Some(model_candidate) = models_to_try.get(model_index) {
@@ -3275,12 +3575,19 @@ impl AgentLoop {
                     .with_vision_override(self.vision_override)
                     .build_for(provider_kind);
 
-                    let same_model_attempts = self.same_model_transient_retries.max(1);
+                    let same_model_attempts = self
+                        .same_model_transient_retries
+                        .clamp(1, MAX_SAME_MODEL_ATTEMPTS);
                     for attempt in 0..same_model_attempts {
                         // Check cancel before each LLM attempt
                         if cancel.load(Ordering::Relaxed) {
                             break 'model_loop;
                         }
+                        if main_calls_remaining == 0 {
+                            last_err = Some(anyhow::anyhow!("primary agent request budget exhausted (maximum {} logical calls per iteration)", MAX_MAIN_CALLS_PER_ITERATION));
+                            break 'model_loop;
+                        }
+                        main_calls_remaining -= 1;
 
                         let streaming_partial = self
                             .enable_streaming
@@ -3334,8 +3641,8 @@ impl AgentLoop {
                                 let msg = e.to_string();
                                 // P1-3 observability: structured fields so failures are
                                 // greppable/alertable without parsing free-text messages.
-                                let attempt_error_code =
-                                    crate::llm::error_class::classify_error(&msg).code();
+                                let error_class = crate::llm::error_class::classify_error(&msg);
+                                let attempt_error_code = error_class.code();
                                 warn!(
                                     model = %model_candidate,
                                     attempt = attempt + 1,
@@ -3348,7 +3655,18 @@ impl AgentLoop {
                                     msg
                                 );
 
-                                if is_context_overflow_error(&msg) && !context_overflow_attempted {
+                                if matches!(
+                                    error_class,
+                                    crate::llm::error_class::ErrorClass::AuthFailed
+                                        | crate::llm::error_class::ErrorClass::QuotaExceeded
+                                ) {
+                                    last_err = Some(e);
+                                    break 'model_loop;
+                                }
+                                if is_context_overflow_error(&msg)
+                                    && !context_overflow_attempted
+                                    && main_calls_remaining > 0
+                                {
                                     context_overflow_attempted = true;
                                     // Forced recovery via the same pluggable
                                     // strategy (Overflow trigger) so a custom
@@ -3453,7 +3771,7 @@ impl AgentLoop {
                                         last_err = Some(e);
                                         break 'model_loop;
                                     }
-                                } else if is_fallback_eligible_error(&msg) {
+                                } else if error_class.is_fallback_eligible() {
                                     // rate_limit / model_not_found: try next fallback model.
                                     // overloaded is intentionally excluded — it should be
                                     // retried with backoff on the same model.
@@ -3465,24 +3783,15 @@ impl AgentLoop {
                                     last_err = Some(e);
                                     break;
                                 } else {
-                                    let is_transient = msg.contains("timeout")
-                                        || msg.contains("connection")
-                                        || msg.contains("overloaded")
-                                        || msg.contains("502")
-                                        || msg.contains("503")
-                                        || msg.contains("529")
-                                        // Network-level decode errors (server closed connection
-                                        // mid-stream, incomplete chunk, etc.) are transient
-                                        || msg.contains("error decoding response body")
-                                        || msg.contains("incomplete message")
-                                        || msg.contains("unexpected eof")
-                                        || msg.contains("broken pipe");
-                                    if !is_transient || attempt + 1 == same_model_attempts {
+                                    if !error_class.is_retryable()
+                                        || attempt + 1 == same_model_attempts
+                                        || main_calls_remaining == 0
+                                    {
                                         last_err = Some(e);
                                         break 'model_loop;
                                     }
                                     // Interruptible backoff sleep — cancel exits immediately
-                                    let backoff = std::time::Duration::from_secs(1 << attempt);
+                                    let backoff = retry_backoff(attempt);
                                     let cancel_for_sleep = Arc::clone(&cancel);
                                     tokio::select! {
                                         biased;
@@ -3533,6 +3842,9 @@ impl AgentLoop {
                                     .await;
                             }
                         }
+                        if let Some(ref m) = succeeded_model {
+                            usage_model = m.clone();
+                        }
                         break 'attempt_with_correction r;
                     }
                     None => {
@@ -3559,21 +3871,26 @@ impl AgentLoop {
                         // silently retried forever either. Give the model exactly
                         // one chance, in the SAME iteration, to resend a complete
                         // and valid call before treating it as a hard failure.
-                        if !tool_args_correction_attempted
+                        if tool_args_corrections < 2
                             && error_class == crate::llm::error_class::ErrorClass::ToolArgsInvalid
                         {
-                            tool_args_correction_attempted = true;
+                            tool_args_corrections += 1;
                             warn!(
-                                "tool_args_invalid on iteration {}: requesting one corrective retry: {}",
-                                _iteration, msg
+                                "tool_args_invalid on iteration {}: corrective retry {}: {}",
+                                _iteration, tool_args_corrections, msg
                             );
+                            let text = if tool_args_corrections == 1 {
+                                "系统提示：你上一次的工具调用参数(arguments) JSON 不完整或无法解析，\
+                                 因此未被执行，也没有产生任何副作用。请重新完整输出这次工具调用\
+                                 （不要截断、不要省略字段）；如内容较长，可考虑拆分为多次更短的调用。"
+                            } else {
+                                "系统提示：工具调用参数 JSON 再次无法解析，仍未执行。字符串中的双引号必须写成 \\\"，\
+                                 反斜杠写成 \\\\，换行写成 \\n。请把大段代码拆成多次较短的 file_write/file_edit 调用，\
+                                 不要在一次调用里放入整份长文件。"
+                            };
                             let corrective = LlmMessage {
                                 role: "user".into(),
-                                content: MessageContent::text(
-                                    "系统提示：你上一次的工具调用参数(arguments) JSON 不完整或无法解析，\
-                                     因此未被执行，也没有产生任何副作用。请重新完整输出这次工具调用\
-                                     （不要截断、不要省略字段）；如内容较长，可考虑拆分为多次更短的调用。",
-                                ),
+                                content: MessageContent::text(text),
                             };
                             new_messages.push(corrective.clone());
                             messages.push(corrective.clone());
@@ -3627,6 +3944,14 @@ impl AgentLoop {
                     response.output_tokens,
                 ) {
                     warn!("Failed to persist usage totals: {}", error);
+                }
+                if let Err(error) = db.add_model_usage(
+                    &ctx.session_id,
+                    &usage_model,
+                    response.input_tokens,
+                    response.output_tokens,
+                ) {
+                    warn!("Failed to persist model usage: {}", error);
                 }
             }
 
@@ -3897,7 +4222,7 @@ impl AgentLoop {
                             continue;
                         }
                         let rh = stable_hash_result(content);
-                        loop_detector.record(name, input, rh);
+                        loop_detector.record(name, input, rh, stable_hash_normalized(content));
                         let receipt = super::tool_receipt::render_receipt(
                             name, input, content, *is_error, None,
                         );
@@ -4460,6 +4785,332 @@ mod tests {
     use serde_json::{json, Value};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::{borrow::Cow, collections::HashMap, path::PathBuf, sync::Arc};
+    use tokio::sync::mpsc;
+
+    fn tool_round(id: &str, args: Value) -> Vec<LlmMessage> {
+        vec![
+            LlmMessage {
+                role: "assistant".into(),
+                content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                    id: id.into(),
+                    name: "read_file".into(),
+                    input: args,
+                }]),
+            },
+            LlmMessage {
+                role: "user".into(),
+                content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                    tool_use_id: id.into(),
+                    content: "same".into(),
+                    is_error: false,
+                }]),
+            },
+        ]
+    }
+
+    #[test]
+    fn repeated_identical_tool_rounds_collapse_to_the_last_one() {
+        let mut msgs = vec![LlmMessage {
+            role: "user".into(),
+            content: MessageContent::text("go"),
+        }];
+        for n in 0..4 {
+            msgs.extend(tool_round(&format!("a{n}"), json!({"path": "x"})));
+        }
+        msgs.extend(tool_round("b", json!({"path": "y"})));
+        let out = super::collapse_repeated_tool_rounds(msgs);
+        // user + 1 collapsed round + the different round
+        assert_eq!(out.len(), 5);
+        let MessageContent::Blocks(b) = &out[2].content else { panic!() };
+        let ContentBlock::ToolResult { content, tool_use_id, .. } = &b[0] else { panic!() };
+        assert_eq!(tool_use_id, "a3");
+        assert!(content.contains("4 times in a row"));
+    }
+
+    fn fresh_detector() -> super::LoopDetectorState {
+        super::LoopDetectorState {
+            history: Vec::new(),
+            consecutive_vision_only_turns: 0,
+            warned: HashMap::new(),
+        }
+    }
+
+    fn record_run(d: &mut super::LoopDetectorState, input: &Value, n: u32) {
+        let content = format!("tests {n}ms\nfail 5\n[recovery_v1]\n{{\"operation_id\":\"op{n}\"}}");
+        d.record(
+            "code_run",
+            input,
+            super::stable_hash_result(&content),
+            super::stable_hash_normalized(&content),
+        );
+        // An edit between runs keeps the consecutive-repeat nudge out of the way.
+        d.record("file_edit", &json!({"n": n}), u64::from(n), u64::from(n));
+    }
+
+    #[test]
+    fn code_run_with_same_outcome_warns_then_blocks() {
+        let input = json!({"command": "node --test"});
+        let batch = vec![("id".to_string(), "code_run".to_string(), input.clone())];
+        let mut d = fresh_detector();
+        for n in 0..3 {
+            record_run(&mut d, &input, n);
+        }
+        assert_eq!(d.detect("code_run", &input, &batch).level, super::LoopLevel::Ok);
+        record_run(&mut d, &input, 3);
+        assert_eq!(d.detect("code_run", &input, &batch).level, super::LoopLevel::Warning);
+        for n in 4..8 {
+            record_run(&mut d, &input, n);
+        }
+        assert_eq!(d.detect("code_run", &input, &batch).level, super::LoopLevel::Critical);
+    }
+
+    #[test]
+    fn ignored_warnings_escalate_to_a_block() {
+        let input = json!({"command": "node --test"});
+        let batch = vec![("id".to_string(), "code_run".to_string(), input.clone())];
+        let mut d = fresh_detector();
+        for n in 0..4 {
+            record_run(&mut d, &input, n);
+        }
+        for _ in 0..3 {
+            assert_eq!(d.detect("code_run", &input, &batch).level, super::LoopLevel::Warning);
+        }
+        assert_eq!(d.detect("code_run", &input, &batch).level, super::LoopLevel::Critical);
+    }
+
+    #[test]
+    fn history_seeds_the_detector_for_a_new_turn() {
+        let input = json!({"command": "node --test"});
+        let mut msgs = Vec::new();
+        for n in 0..5 {
+            msgs.extend(tool_round(&format!("c{n}"), input.clone()));
+        }
+        // tool_round uses `read_file`; seeding keeps whatever tool name was used.
+        let mut d = fresh_detector();
+        d.seed_from_messages(&msgs);
+        assert_eq!(d.history.len(), 5);
+    }
+
+
+    #[test]
+    fn different_arguments_are_not_collapsed() {
+        let mut msgs = Vec::new();
+        msgs.extend(tool_round("a", json!({"path": "x"})));
+        msgs.extend(tool_round("b", json!({"path": "y"})));
+        assert_eq!(super::collapse_repeated_tool_rounds(msgs).len(), 4);
+    }
+
+    #[test]
+    fn retry_candidates_and_backoff_are_hard_bounded() {
+        let fallbacks = vec!["primary", "one", "one", "two", "three", "four"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            super::bounded_model_candidates("primary".into(), &fallbacks),
+            vec!["primary", "one", "two", "three"]
+        );
+        assert_eq!(super::retry_backoff(0).as_secs(), 1);
+        assert_eq!(super::retry_backoff(1).as_secs(), 2);
+        assert_eq!(super::retry_backoff(u32::MAX).as_secs(), 8);
+    }
+
+    struct RetryPolicyClient {
+        error: &'static str,
+        calls: Arc<AtomicUsize>,
+        cancel_on_call: Option<Arc<AtomicBool>>,
+    }
+    #[async_trait]
+    impl crate::llm::LlmClient for RetryPolicyClient {
+        async fn stream(&self, _req: LlmRequest, _tx: mpsc::Sender<LlmChunk>) -> Result<()> {
+            unreachable!("retry fixture uses complete")
+        }
+        async fn complete(&self, _req: LlmRequest) -> Result<LlmResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(cancel) = &self.cancel_on_call {
+                cancel.store(true, Ordering::SeqCst);
+            }
+            Err(anyhow::anyhow!(self.error))
+        }
+    }
+    async fn retry_fixture(error: &'static str, cancel_on_call: bool) -> usize {
+        retry_fixture_inner(error, cancel_on_call, false).await
+    }
+    async fn retry_fixture_inner(
+        error: &'static str,
+        cancel_on_call: bool,
+        cancel_during_backoff: bool,
+    ) -> usize {
+        retry_fixture_timed(error, cancel_on_call, cancel_during_backoff)
+            .await
+            .0
+    }
+    async fn retry_fixture_timed(
+        error: &'static str,
+        cancel_on_call: bool,
+        cancel_during_backoff: bool,
+    ) -> (usize, std::time::Duration) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut agent = tier_agent(
+            RetryPolicyClient {
+                error,
+                calls: calls.clone(),
+                cancel_on_call: cancel_on_call.then(|| cancel.clone()),
+            },
+            None,
+            crate::agent::harness::LayeredBudget::from_context_window(
+                TIER_TEST_CONTEXT_WINDOW,
+                TIER_TEST_MAX_TOKENS,
+            ),
+        );
+        agent.same_model_transient_retries = u32::MAX;
+        agent.fallback_models = (0..50).map(|i| format!("fallback-{i}")).collect();
+        let delayed_cancel = cancel_during_backoff.then(|| {
+            let calls = calls.clone();
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                while calls.load(Ordering::SeqCst) == 0 {
+                    tokio::task::yield_now().await;
+                }
+                // The immediate fake failure has entered its one-second backoff.
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                cancel.store(true, Ordering::SeqCst);
+            })
+        });
+        let (tx, mut rx) = mpsc::channel(64);
+        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            agent.run(
+                vec![make_text_msg("user", "retry fixture")],
+                tx,
+                cancel.clone(),
+                tier_tool_context("retry-fixture".into()),
+            ),
+        )
+        .await
+        .expect("bounded retry fixture must finish");
+        let elapsed = started.elapsed();
+        if !cancel_on_call && !cancel_during_backoff {
+            assert!(result.is_err());
+        }
+        drain.await.unwrap();
+        if let Some(delayed_cancel) = delayed_cancel {
+            delayed_cancel.await.unwrap();
+        }
+        (calls.load(Ordering::SeqCst), elapsed)
+    }
+    #[tokio::test]
+    async fn permanent_mixed_errors_never_retry_or_fallback() {
+        assert_eq!(
+            retry_fixture(
+                "OpenAI API error 401 Unauthorized: connection timeout context length exceeded",
+                false
+            )
+            .await,
+            1
+        );
+        assert_eq!(
+            retry_fixture(
+                "OpenAI API error 429: insufficient_quota connection timeout",
+                false
+            )
+            .await,
+            1
+        );
+    }
+    #[tokio::test]
+    async fn fallback_candidates_and_cancel_are_bounded_in_actual_loop() {
+        assert_eq!(
+            retry_fixture("OpenAI API error 429: rate_limit", false).await,
+            4
+        );
+        assert_eq!(retry_fixture("connection timeout", true).await, 1);
+    }
+
+    #[tokio::test]
+    async fn extreme_retry_count_stops_after_five_real_attempts() {
+        assert_eq!(retry_fixture("connection timeout", false).await, 5);
+    }
+    #[tokio::test]
+    async fn cancellation_during_real_backoff_starts_no_second_request() {
+        let (calls, elapsed) = retry_fixture_timed("connection timeout", false, true).await;
+        assert_eq!(calls, 1);
+        // Lower bound: cancellation is raised >=50ms after the first request, so a run that
+        // never entered backoff (finishing immediately) is rejected.
+        assert!(
+            elapsed >= std::time::Duration::from_millis(50),
+            "run finished before the backoff window was entered: {elapsed:?}"
+        );
+        // Upper bound: the first real backoff is one second; finishing under 800ms shows the
+        // wait was interrupted by cancellation rather than slept out.
+        assert!(
+            elapsed < std::time::Duration::from_millis(800),
+            "cancelled backoff took {elapsed:?}"
+        );
+    }
+    struct CorrectionBudgetClient {
+        calls: Arc<AtomicUsize>,
+    }
+    #[async_trait]
+    impl crate::llm::LlmClient for CorrectionBudgetClient {
+        async fn stream(&self, _req: LlmRequest, _tx: mpsc::Sender<LlmChunk>) -> Result<()> {
+            unreachable!("budget fixture uses complete")
+        }
+        async fn complete(&self, _req: LlmRequest) -> Result<LlmResponse> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            match call {
+                1..=3 | 9..=11 => Err(anyhow::anyhow!("OpenAI API error 429: rate_limit")),
+                8 => Err(anyhow::anyhow!("tool_args_invalid: incomplete JSON")),
+                _ => Err(anyhow::anyhow!("connection timeout")),
+            }
+        }
+    }
+    #[tokio::test]
+    async fn correction_shares_twelve_primary_call_budget() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut agent = tier_agent(
+            CorrectionBudgetClient {
+                calls: calls.clone(),
+            },
+            None,
+            crate::agent::harness::LayeredBudget::from_context_window(
+                TIER_TEST_CONTEXT_WINDOW,
+                TIER_TEST_MAX_TOKENS,
+            ),
+        );
+        agent.same_model_transient_retries = u32::MAX;
+        agent.fallback_models = vec!["one".into(), "two".into(), "three".into()];
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, mut rx) = mpsc::channel(64);
+        let drain = tokio::spawn(async move {
+            let mut events = Vec::new();
+            while let Some(event) = rx.recv().await {
+                events.push(event);
+            }
+            events
+        });
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            agent.run(
+                vec![make_text_msg("user", "bounded correction")],
+                tx,
+                cancel,
+                tier_tool_context("correction-budget".into()),
+            ),
+        )
+        .await
+        .expect("correction budget must terminate");
+        assert!(result.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 12);
+        let events = drain.await.unwrap();
+        assert_eq!(events.iter().filter(|event| matches!(event, AgentEvent::Notice { code: Some(code), .. } if code == "tool_args_invalid")).count(), 1);
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::ToolStart { .. })));
+    }
 
     // ── Mock LLM clients ──────────────────────────────────────────────────────
 
@@ -4539,6 +5190,323 @@ mod tests {
     }
 
     struct SchemaTool;
+
+    struct CompletionFixtureTool {
+        started: Arc<tokio::sync::Notify>,
+        pending: bool,
+    }
+    #[async_trait]
+    impl Tool for CompletionFixtureTool {
+        fn name(&self) -> &str {
+            "completion_fixture"
+        }
+        fn description(&self) -> &str {
+            "controlled completion fixture"
+        }
+        fn input_schema(&self) -> Value {
+            json!({"type":"object"})
+        }
+        async fn call(&self, _: Value, _: &ToolContext) -> Result<crate::agent::tool::ToolResult> {
+            self.started.notify_one();
+            if self.pending {
+                std::future::pending::<()>().await;
+            }
+            Err(anyhow::anyhow!("normal tool failure"))
+        }
+    }
+    #[tokio::test]
+    async fn dropped_generic_invocation_is_unconfirmed_even_without_process_worker() {
+        let ctx = tier_tool_context("completion".into());
+        let registry = ctx.owned_completion();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let tool = CompletionFixtureTool {
+            started: started.clone(),
+            pending: true,
+        };
+        let mut call = Box::pin(super::call_with_completion(&tool, json!({}), &ctx));
+        tokio::select! { result = &mut call => panic!("pending tool unexpectedly returned: {result:?}"), _ = started.notified() => {} }
+        ctx.cancel.store(true, Ordering::SeqCst);
+        drop(call);
+        assert_eq!(
+            registry.drain(std::time::Duration::ZERO).await,
+            crate::agent::tool_completion::DrainOutcome::Failed {
+                active: 0,
+                failures: 1
+            }
+        );
+    }
+    #[tokio::test]
+    async fn normal_tool_error_completes_invocation_and_cancelled_context_never_calls() {
+        let ctx = tier_tool_context("completion".into());
+        let registry = ctx.owned_completion();
+        let tool = CompletionFixtureTool {
+            started: Arc::new(tokio::sync::Notify::new()),
+            pending: false,
+        };
+        assert!(super::call_with_completion(&tool, json!({}), &ctx)
+            .await
+            .is_err());
+        assert_eq!(
+            registry.drain(std::time::Duration::ZERO).await,
+            crate::agent::tool_completion::DrainOutcome::Complete
+        );
+        let other = tier_tool_context("cancelled".into());
+        other.cancel.store(true, Ordering::SeqCst);
+        let pending = CompletionFixtureTool {
+            started: Arc::new(tokio::sync::Notify::new()),
+            pending: true,
+        };
+        assert!(super::call_with_completion(&pending, json!({}), &other)
+            .await
+            .is_err());
+        assert_eq!(
+            other
+                .owned_completion()
+                .drain(std::time::Duration::ZERO)
+                .await,
+            crate::agent::tool_completion::DrainOutcome::Complete
+        );
+    }
+
+    /// Mimics the sandboxed shell: on cancel it finishes its own teardown and returns
+    /// a normal result instead of being dropped.
+    struct CooperativeTeardownTool;
+    #[async_trait]
+    impl Tool for CooperativeTeardownTool {
+        fn name(&self) -> &str {
+            "cooperative_teardown"
+        }
+        fn description(&self) -> &str {
+            "fixture that tears down after cancel"
+        }
+        fn input_schema(&self) -> Value {
+            json!({"type":"object"})
+        }
+        async fn call(&self, _: Value, ctx: &ToolContext) -> Result<crate::agent::tool::ToolResult> {
+            while !ctx.cancel.load(Ordering::SeqCst) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+            Ok(crate::agent::tool::ToolResult::ok("torn down"))
+        }
+    }
+    #[tokio::test]
+    async fn cancelled_tool_that_tears_down_keeps_its_own_result() {
+        let mut agent = tier_agent(
+            CorrectionBudgetClient {
+                calls: Arc::new(AtomicUsize::new(0)),
+            },
+            None,
+            crate::agent::harness::LayeredBudget::from_context_window(
+                TIER_TEST_CONTEXT_WINDOW,
+                TIER_TEST_MAX_TOKENS,
+            ),
+        );
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(CooperativeTeardownTool));
+        agent.registry = Arc::new(registry);
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut ctx = tier_tool_context("cancel-grace".into());
+        ctx.cancel = cancel.clone();
+        ctx.bypass_permissions = true;
+        let (event_tx, _event_rx) = mpsc::channel(64);
+
+        let trigger = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            trigger.store(true, Ordering::SeqCst);
+        });
+        let blocks = agent
+            .execute_single_tool(
+                "t-cancel",
+                "cooperative_teardown",
+                &json!({}),
+                &ctx,
+                &event_tx,
+                &cancel,
+            )
+            .await;
+        let text = format!("{blocks:?}");
+        assert!(text.contains("torn down"), "tool's own result must survive cancel: {text}");
+        assert!(!text.contains("已被用户取消"), "cancel must not override a finished teardown: {text}");
+    }
+
+    /// A tool that ignores cancel entirely (no teardown). The loop must still stop
+    /// waiting after the grace period and report the generic user-cancel result.
+    struct NonTerminatingTool;
+    #[async_trait]
+    impl Tool for NonTerminatingTool {
+        fn name(&self) -> &str {
+            "non_terminating"
+        }
+        fn description(&self) -> &str {
+            "fixture that never observes cancel"
+        }
+        fn input_schema(&self) -> Value {
+            json!({"type":"object"})
+        }
+        async fn call(&self, _: Value, _ctx: &ToolContext) -> Result<crate::agent::tool::ToolResult> {
+            tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+            Ok(crate::agent::tool::ToolResult::ok("never"))
+        }
+    }
+    #[tokio::test]
+    async fn uncooperative_tool_is_interrupted_after_grace() {
+        let mut agent = tier_agent(
+            CorrectionBudgetClient {
+                calls: Arc::new(AtomicUsize::new(0)),
+            },
+            None,
+            crate::agent::harness::LayeredBudget::from_context_window(
+                TIER_TEST_CONTEXT_WINDOW,
+                TIER_TEST_MAX_TOKENS,
+            ),
+        );
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(NonTerminatingTool));
+        agent.registry = Arc::new(registry);
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut ctx = tier_tool_context("cancel-interrupt".into());
+        ctx.cancel = cancel.clone();
+        ctx.bypass_permissions = true;
+        let (event_tx, _event_rx) = mpsc::channel(64);
+
+        let trigger = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            trigger.store(true, Ordering::SeqCst);
+        });
+        let started = std::time::Instant::now();
+        let blocks = agent
+            .execute_single_tool("t-interrupt", "non_terminating", &json!({}), &ctx, &event_tx, &cancel)
+            .await;
+        let elapsed = started.elapsed();
+        let text = format!("{blocks:?}");
+        assert!(text.contains("已被用户取消"), "uncooperative tool must be interrupted: {text}");
+        assert!(
+            elapsed >= std::time::Duration::from_secs(super::CANCEL_GRACE_SECS),
+            "grace period must actually be waited before interrupting: {elapsed:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(super::CANCEL_GRACE_SECS + 5),
+            "interrupt took {elapsed:?}: {text}"
+        );
+    }
+
+    /// Real sandboxed shell, cancelled mid-run through the agent's execution path.
+    /// The shell tears down its own AppContainer job and returns its cancel result; the
+    /// watcher's generic "已被用户取消" must not replace it.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn real_shell_cancel_keeps_shell_cancel_result_within_grace() {
+        let temp = tempfile::tempdir().expect("create shell cancel root");
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("create shell workspace");
+        let mut agent = tier_agent(
+            CorrectionBudgetClient {
+                calls: Arc::new(AtomicUsize::new(0)),
+            },
+            None,
+            crate::agent::harness::LayeredBudget::from_context_window(
+                TIER_TEST_CONTEXT_WINDOW,
+                TIER_TEST_MAX_TOKENS,
+            ),
+        );
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(crate::tools::shell::ShellTool::default()));
+        agent.registry = Arc::new(registry);
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut ctx = tier_tool_context("shell-cancel".into());
+        ctx.workspace_root = workspace;
+        ctx.cancel = cancel.clone();
+        ctx.bypass_permissions = true;
+        let (event_tx, _event_rx) = mpsc::channel(64);
+
+        let trigger = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+            trigger.store(true, Ordering::SeqCst);
+        });
+        let started = std::time::Instant::now();
+        let blocks = agent
+            .execute_single_tool(
+                "t-shell-cancel",
+                "shell",
+                &json!({
+                    "command": "for /L %i in (1,1,200000000) do @rem",
+                    "interpreter": "cmd",
+                    "timeout": 120
+                }),
+                &ctx,
+                &event_tx,
+                &cancel,
+            )
+            .await;
+        let elapsed = started.elapsed();
+        let text = format!("{blocks:?}");
+        assert!(text.contains("Command was cancelled"), "shell must report its own cancel: {text}");
+        assert!(!text.contains("已被用户取消"), "watcher must not replace shell teardown: {text}");
+        assert!(elapsed < std::time::Duration::from_secs(20), "cancel took {elapsed:?}: {text}");
+    }
+
+    /// Real sandboxed code_run, cancelled mid-run through the agent's execution path.
+    /// Its own teardown returns "Sandbox command was cancelled"; the watcher's generic
+    /// "已被用户取消" must not replace it.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn real_code_run_cancel_keeps_its_own_result_within_grace() {
+        let temp = tempfile::tempdir().expect("create code_run cancel root");
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("create code_run workspace");
+        let mut agent = tier_agent(
+            CorrectionBudgetClient {
+                calls: Arc::new(AtomicUsize::new(0)),
+            },
+            None,
+            crate::agent::harness::LayeredBudget::from_context_window(
+                TIER_TEST_CONTEXT_WINDOW,
+                TIER_TEST_MAX_TOKENS,
+            ),
+        );
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(crate::tools::code_run::CodeRunTool::default()));
+        agent.registry = Arc::new(registry);
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut ctx = tier_tool_context("code-run-cancel".into());
+        ctx.workspace_root = workspace;
+        ctx.cancel = cancel.clone();
+        ctx.bypass_permissions = true;
+        let (event_tx, _event_rx) = mpsc::channel(64);
+
+        let trigger = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+            trigger.store(true, Ordering::SeqCst);
+        });
+        let started = std::time::Instant::now();
+        let blocks = agent
+            .execute_single_tool(
+                "t-code-run-cancel",
+                "code_run",
+                &json!({
+                    "command": "for /L %i in (1,1,200000000) do @rem",
+                    "timeout_secs": 120
+                }),
+                &ctx,
+                &event_tx,
+                &cancel,
+            )
+            .await;
+        let elapsed = started.elapsed();
+        let text = format!("{blocks:?}");
+        assert!(text.contains("Sandbox command was cancelled"), "code_run must report its own cancel: {text}");
+        assert!(!text.contains("已被用户取消"), "watcher must not replace code_run teardown: {text}");
+        assert!(elapsed < std::time::Duration::from_secs(20), "cancel took {elapsed:?}: {text}");
+    }
 
     #[async_trait]
     impl Tool for SchemaTool {
@@ -5393,7 +6361,12 @@ mod tests {
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            agent.run(vec![make_text_msg("user", "写个文件")], event_tx, cancel, ctx),
+            agent.run(
+                vec![make_text_msg("user", "写个文件")],
+                event_tx,
+                cancel,
+                ctx,
+            ),
         )
         .await
         .expect("agent run should not hang");

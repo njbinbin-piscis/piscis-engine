@@ -1,20 +1,26 @@
+#[cfg(windows)]
 use super::output::extract_error_lines;
 use crate::agent::tool::{Tool, ToolContext, ToolResult};
-use crate::proc::tokio_command;
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use std::process::Stdio;
+#[cfg(windows)]
+use std::ffi::OsString;
+#[cfg(windows)]
+use std::path::PathBuf;
+#[cfg(windows)]
 use std::time::{Duration, Instant};
-use tokio::process::Command;
-use tokio::time::timeout;
 
 const DEFAULT_TIMEOUT_SECS: u64 = 60;
 const MAX_TIMEOUT_SECS: u64 = 300;
 /// Keep head + tail of each stream; long build logs are rarely useful in full.
-const MAX_STREAM_BYTES: usize = 8 * 1024; // 8 KB per stream
+#[cfg(windows)]
+const MAX_STREAM_BYTES: usize = 64 * 1024; // 64 KB capture per stream (presentation truncates lower)
 
-pub struct CodeRunTool;
+#[derive(Default)]
+pub struct CodeRunTool {
+    pub background_registry: Option<std::sync::Arc<crate::background::BackgroundRegistry>>,
+}
 
 #[async_trait]
 impl Tool for CodeRunTool {
@@ -23,7 +29,15 @@ impl Tool for CodeRunTool {
     }
 
     fn description(&self) -> &str {
-        "Run a shell command in a project directory and capture its output. \
+        #[cfg(windows)]
+        return "Run commands inside a Windows AppContainer with access limited to the selected workspace. Network and isolation follow the user's security level in Settings: strict = AppContainer with no network, balanced = run as the current user with network and cwd pinned to the workspace, dev = sandbox disabled. The command is cmd.exe syntax, passed through unchanged with UTF-8 output: double quotes work as usual (python -c \"print('hi')\", node -e \"console.log(1)\"), && / || / & / | / > chain and redirect, %VAR% expands, ! is literal. For PowerShell syntax use the shell tool. Other platforms do not execute this tool because an OS sandbox is unavailable.";
+
+        #[cfg(not(windows))]
+        return "Unavailable: this platform does not have an enabled operating-system command sandbox. Commands are not executed.";
+
+        #[allow(unreachable_code)]
+        "Run a shell command in a project directory and capture its output as the current OS user. \
+         Operating-system containment is not enabled; approval and workspace scoping do not block access to other resources. \
          Designed for coding tasks: building, testing, linting, running scripts. \
          Returns exit_code, stdout, stderr, and duration_ms. \
          Use `cwd` to set the project root (e.g. where Cargo.toml / package.json lives). \
@@ -51,7 +65,28 @@ impl Tool for CodeRunTool {
                 },
                 "timeout_secs": {
                     "type": "integer",
-                    "description": "Timeout in seconds (default 60, max 300). Increase for slow builds."
+                    "description": "Foreground timeout in seconds (default 60, max 300). On timeout the still-running command is moved to the background registry instead of being killed."
+                },
+                "background": {
+                    "type": "boolean",
+                    "description": "Start in the background registry and return immediately with a bg_id. Use for slow builds/tests and servers. Manage it with process_wait/process_output/process_kill. Output is captured automatically (process_output, and the user's background panel), so redirecting it to a file is usually unnecessary; redirect only when you need the file itself."
+                },
+                "service": {
+                    "type": "boolean",
+                    "description": "With background=true: a long-lived process (dev server, watcher). No runtime cap; it lives until killed, the session is deleted, or the app exits. Notified when ready (if ready_port/ready_log is set) and again only on unexpected exit."
+                },
+                "notify_on": {
+                    "type": "string",
+                    "enum": ["exit", "ready"],
+                    "description": "For background tasks: notify the session on exit (default) or when the readiness condition (ready_port/ready_log) first fires."
+                },
+                "ready_port": {
+                    "type": "integer",
+                    "description": "Readiness condition: a TCP connect to 127.0.0.1 on this port succeeds (dev servers)."
+                },
+                "ready_log": {
+                    "type": "string",
+                    "description": "Readiness condition: output contains this substring (dev servers)."
                 },
                 "env": {
                     "type": "object",
@@ -69,7 +104,7 @@ impl Tool for CodeRunTool {
     async fn call(&self, input: Value, ctx: &ToolContext) -> Result<ToolResult> {
         let command = match input["command"].as_str() {
             Some(c) if !c.trim().is_empty() => c,
-            _ => return Ok(ToolResult::err("Missing required parameter: command")),
+            _ => return recovery_error("Missing required parameter: command", ctx, false),
         };
 
         let cwd = if let Some(cwd_str) = input["cwd"].as_str() {
@@ -83,10 +118,14 @@ impl Tool for CodeRunTool {
         };
 
         if !cwd.exists() {
-            return Ok(ToolResult::err(format!(
-                "Working directory does not exist: {}",
-                cwd.display()
-            )));
+            return recovery_error(
+                format!(
+                    "Working directory does not exist: {}",
+                    crate::path_text::display_path(&cwd)
+                ),
+                ctx,
+                false,
+            );
         }
 
         let timeout_secs = input["timeout_secs"]
@@ -94,108 +133,301 @@ impl Tool for CodeRunTool {
             .unwrap_or(DEFAULT_TIMEOUT_SECS)
             .min(MAX_TIMEOUT_SECS);
 
-        let mut cmd = build_cmd(command);
-        cmd.current_dir(&cwd)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-
-        if let Some(env_obj) = input["env"].as_object() {
-            for (k, v) in env_obj {
-                if let Some(val) = v.as_str() {
-                    cmd.env(k, val);
-                }
+        #[cfg(not(windows))]
+        {
+            // See shell.rs: foreground stays refused without an OS sandbox;
+            // explicit background work runs registered via /bin/sh.
+            let bg_params = super::background_process::parse_bg_params(&input);
+            if !bg_params.detached {
+                let _ = (command, cwd, timeout_secs, ctx);
+                return recovery_error(
+                    "Command execution refused: operating-system containment is unavailable on this platform.", ctx, false);
             }
+            let Some(registry) = self.background_registry.clone() else {
+                return recovery_error(
+                    "Background execution is not configured by this host; run the command in the foreground instead.",
+                    ctx,
+                    false,
+                );
+            };
+            let spec = super::background_process::bg_spec(
+                ctx,
+                command.chars().take(200).collect::<String>(),
+                cwd.to_string_lossy().into_owned(),
+                &bg_params,
+            );
+            let mut cmd = std::process::Command::new("/bin/sh");
+            cmd.arg("-c").arg(command).current_dir(&cwd);
+            return match super::background_process::spawn_command_detached(&registry, spec, cmd) {
+                Ok(entry) => Ok(super::background_process::detached_result(
+                    &entry,
+                    true,
+                    &[],
+                    &[],
+                )),
+                Err(error) => recovery_error(error, ctx, false),
+            };
         }
 
-        let start = Instant::now();
-        let run_result = timeout(Duration::from_secs(timeout_secs), cmd.output()).await;
-        let duration_ms = start.elapsed().as_millis() as u64;
-
-        match run_result {
-            Err(_) => Ok(ToolResult::err(format!(
-                "Command timed out after {}s.\n\
-                     Consider: breaking into smaller steps, increasing timeout_secs, \
-                     or checking if the process is hanging waiting for input.",
-                timeout_secs
-            ))),
-            Ok(Err(e)) => Ok(ToolResult::err(format!("Failed to spawn process: {}", e))),
-            Ok(Ok(output)) => {
-                let exit_code = output.status.code().unwrap_or(-1);
-                let stdout_raw = String::from_utf8_lossy(&output.stdout);
-                let stderr_raw = String::from_utf8_lossy(&output.stderr);
-
-                let stdout = trim_stream(&stdout_raw, MAX_STREAM_BYTES);
-                let stderr = trim_stream(&stderr_raw, MAX_STREAM_BYTES);
-
-                let status_label = if exit_code == 0 { "SUCCESS" } else { "FAILED" };
-
-                let mut parts = vec![format!(
-                    "exit_code: {} ({})  duration: {}ms  cwd: {}",
-                    exit_code,
-                    status_label,
-                    duration_ms,
-                    cwd.display()
-                )];
-
-                if !stdout.is_empty() {
-                    parts.push(format!("--- stdout ---\n{}", stdout));
+        #[cfg(windows)]
+        let (exit_code, stdout_bytes, stderr_bytes, duration_ms, mut report) = {
+            let workspace_root = match ctx.workspace_root.canonicalize() {
+                Ok(root) => root,
+                Err(error) => {
+                    return recovery_error(
+                        format!("Sandbox workspace is unavailable: {error}"),
+                        ctx,
+                        false,
+                    )
                 }
-                if !stderr.is_empty() {
-                    parts.push(format!("--- stderr ---\n{}", stderr));
+            };
+            let sandbox_disabled =
+                ctx.settings.sandbox_mode == crate::agent::tool::SandboxMode::Disabled;
+            let cwd = match cwd.canonicalize() {
+                Ok(cwd)
+                    if cwd.is_dir()
+                        && (sandbox_disabled || cwd.starts_with(&workspace_root)) =>
+                {
+                    cwd
                 }
-                if stdout.is_empty() && stderr.is_empty() {
-                    parts.push("(no output)".to_string());
+                Ok(_) => {
+                    return recovery_error(
+                        "Sandbox working directory must be an existing directory inside workspace_root.", ctx, false)
                 }
-
-                if exit_code != 0 {
-                    let combined = format!("{}{}", stdout_raw, stderr_raw);
-                    if let Some(hint) = diagnose(&combined, command) {
-                        parts.push(format!("--- diagnosis ---\n{}", hint));
-                    }
-                    let errors = extract_error_lines(&stdout_raw, &stderr_raw);
-                    if !errors.is_empty() {
-                        parts.push(format!("--- errors ---\n{}", errors.join("\n")));
-                    }
+                Err(error) => {
+                    return recovery_error(format!(
+                        "Sandbox working directory is unavailable: {error}"
+                    ), ctx, false)
                 }
-
-                Ok(ToolResult::ok(parts.join("\n\n")))
+            };
+            let program = match std::env::var_os("WINDIR") {
+                Some(windir) => PathBuf::from(windir).join("System32\\cmd.exe"),
+                None => return recovery_error(
+                    "Cannot locate the Windows command interpreter; refusing unsandboxed fallback.",
+                    ctx,
+                    false,
+                ),
+            };
+            let args = super::shell::cmd_utf8_args();
+            let mut env_overrides = input["env"]
+                .as_object()
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(|(key, value)| {
+                            value
+                                .as_str()
+                                .map(|value| (OsString::from(key), OsString::from(value)))
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            super::shell::add_utf8_env_defaults(&mut env_overrides);
+            env_overrides.push((
+                OsString::from(super::shell::CMD_LINE_ENV),
+                OsString::from(command),
+            ));
+            let timeout = Duration::from_secs(timeout_secs);
+            let cancel = ctx.cancel.clone();
+            let sandbox_mode = ctx.settings.sandbox_mode;
+            let bg_params = super::background_process::parse_bg_params(&input);
+            let bg_registry = self.background_registry.clone();
+            if bg_params.detached && bg_registry.is_none() {
+                return recovery_error(
+                    "Background execution is not configured by this host; run the command in the foreground instead.",
+                    ctx,
+                    false,
+                );
             }
+            let bg_spec = super::background_process::bg_spec(
+                ctx,
+                command.chars().take(200).collect::<String>(),
+                cwd.to_string_lossy().into_owned(),
+                &bg_params,
+            );
+            let bg_detached = bg_params.detached;
+            let worker_workspace_root = workspace_root.clone();
+            let start = Instant::now();
+            let receipt = match ctx.owned_completion().register() {
+                Ok(receipt) => receipt,
+                Err(error) => return recovery_error(error, ctx, false),
+            };
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let spawn_res = std::thread::Builder::new()
+                .name("code-run-sandbox".to_string())
+                .stack_size(8 * 1024 * 1024)
+                .spawn(move || {
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        match bg_registry {
+                            Some(registry) => crate::proc::windows_sandbox::run_sandboxed_command_managed(
+                                program.as_os_str(),
+                                &args,
+                                &worker_workspace_root,
+                                &cwd,
+                                timeout,
+                                cancel,
+                                &env_overrides,
+                                MAX_STREAM_BYTES,
+                                sandbox_mode,
+                                crate::proc::windows_sandbox::ManagedBackground {
+                                    registry,
+                                    spec: bg_spec,
+                                    detached: bg_detached,
+                                },
+                            ),
+                            None => crate::proc::windows_sandbox::run_sandboxed_command(
+                                program.as_os_str(),
+                                &args,
+                                &worker_workspace_root,
+                                &cwd,
+                                timeout,
+                                cancel,
+                                &env_overrides,
+                                MAX_STREAM_BYTES,
+                                sandbox_mode,
+                            )
+                            .map(crate::proc::windows_sandbox::ManagedSandboxed::Completed),
+                        }
+                    }))
+                    .unwrap_or_else(|_| {
+                        Err(anyhow::anyhow!("sandbox worker panicked unexpectedly"))
+                    });
+                    receipt.complete(
+                        result
+                            .as_ref()
+                            .map(|_| ())
+                            .map_err(|_| "sandbox cleanup unconfirmed".into()),
+                    );
+                    let _ = tx.send(result);
+                });
+            if let Err(error) = spawn_res {
+                return recovery_error(
+                    format!("Failed to spawn sandbox worker thread: {error}"),
+                    ctx,
+                    false,
+                );
+            }
+            let run_result = rx.await;
+            let duration_ms = start.elapsed().as_millis() as u64;
+            if let Ok(Ok(crate::proc::windows_sandbox::ManagedSandboxed::Detached {
+                entry,
+                stdout_so_far,
+                stderr_so_far,
+            })) = &run_result
+            {
+                return Ok(super::background_process::detached_result(
+                    entry,
+                    bg_detached,
+                    stdout_so_far,
+                    stderr_so_far,
+                ));
+            }
+            let output = match run_result {
+                Ok(Ok(crate::proc::windows_sandbox::ManagedSandboxed::Completed(output))) => output,
+                Ok(Ok(crate::proc::windows_sandbox::ManagedSandboxed::Detached { .. })) => {
+                    unreachable!("detached handled above")
+                }
+                Ok(Err(error)) => {
+                    return recovery_error(format!(
+                        "Sandbox setup or cleanup failed; command was not retried outside the sandbox: {error:#}"
+                    ), ctx, true)
+                }
+                Err(error) => {
+                    return recovery_error(format!(
+                        "Sandbox command worker failed: {error}"
+                    ), ctx, true)
+                }
+            };
+            let report = output.recovery_report(recovery_operation_id(ctx))?;
+            if output.timed_out {
+                return report.attach(ToolResult::err(format!(
+                    "Sandbox command timed out after {timeout_secs}s; the Job Object was terminated."
+                ))).map_err(anyhow::Error::msg);
+            }
+            if output.cancelled {
+                return report
+                    .attach(ToolResult::err(
+                        "Sandbox command was cancelled; the Job Object was terminated.",
+                    ))
+                    .map_err(anyhow::Error::msg);
+            }
+            (
+                output.exit_code,
+                output.stdout,
+                output.stderr,
+                duration_ms,
+                report,
+            )
+        };
+
+        #[cfg(windows)]
+        {
+            let stdout_raw = super::output::decode_process_output(&stdout_bytes);
+            let stderr_raw = super::output::decode_process_output(&stderr_bytes);
+            // Balanced presentation: per-line elision + whole-line head/tail
+            // (see tools::output::smart_truncate), far below the capture cap.
+            let (stdout, stdout_meta) = crate::tools::output::smart_truncate(
+                stdout_raw.trim(),
+                16 * 1024,
+                crate::tools::output::TruncateStrategy::HeadTail,
+            );
+            let (stderr, stderr_meta) = crate::tools::output::smart_truncate(
+                stderr_raw.trim(),
+                8 * 1024,
+                crate::tools::output::TruncateStrategy::HeadTail,
+            );
+            let stdout_trimmed = stdout_meta.truncated;
+            let stderr_trimmed = stderr_meta.truncated;
+            report.note_presentation_truncation(stdout_trimmed, stderr_trimmed);
+            let status_label = if exit_code == 0 { "SUCCESS" } else { "FAILED" };
+            let mut parts = vec![format!(
+                "exit_code: {} ({})  duration: {}ms  cwd: {}",
+                exit_code,
+                status_label,
+                duration_ms,
+                crate::path_text::display_path(&cwd)
+            )];
+            if !stdout.is_empty() {
+                parts.push(format!("--- stdout ---\n{}", stdout));
+            }
+            if !stderr.is_empty() {
+                parts.push(format!("--- stderr ---\n{}", stderr));
+            }
+            if stdout.is_empty() && stderr.is_empty() {
+                parts.push("(no output)".to_string());
+            }
+            if stdout_trimmed || stderr_trimmed {
+                if let Some(path) = crate::tools::output::spill_tool_output(
+                    &ctx.workspace_root,
+                    "code_run",
+                    &stdout_raw,
+                    &stderr_raw,
+                ) {
+                    parts.push(format!(
+                        "Full output saved to {} — inspect omitted parts with file_read (offset/limit) or file_search instead of re-running.",
+                        crate::path_text::display_path(&path)
+                    ));
+                }
+            }
+            if exit_code != 0 {
+                let combined = format!("{}{}", stdout_raw, stderr_raw);
+                if let Some(hint) = diagnose(&combined, command) {
+                    parts.push(format!("--- diagnosis ---\n{}", hint));
+                }
+                let errors = extract_error_lines(&stdout_raw, &stderr_raw);
+                if !errors.is_empty() {
+                    parts.push(format!("--- errors ---\n{}", errors.join("\n")));
+                }
+            }
+            report
+                .attach(ToolResult::ok(parts.join("\n\n")))
+                .map_err(anyhow::Error::msg)
         }
     }
-}
-
-/// Trim a stream to at most `max_bytes`, keeping head and tail.
-fn trim_stream(s: &str, max_bytes: usize) -> String {
-    let s = s.trim();
-    if s.len() <= max_bytes {
-        return s.to_string();
-    }
-    let head_bytes = max_bytes * 3 / 4;
-    let tail_bytes = max_bytes - head_bytes;
-    // Find valid char boundaries
-    let head_end = s
-        .char_indices()
-        .map(|(i, _)| i)
-        .take_while(|&i| i <= head_bytes)
-        .last()
-        .unwrap_or(0);
-    let tail_start = s
-        .char_indices()
-        .rev()
-        .map(|(i, _)| i)
-        .take_while(|&i| s.len() - i <= tail_bytes)
-        .last()
-        .unwrap_or(s.len());
-    format!(
-        "{}\n\n... [{} bytes trimmed — use file_read or scroll output for full log] ...\n\n{}",
-        &s[..head_end],
-        s.len() - max_bytes,
-        &s[tail_start..]
-    )
 }
 
 /// Heuristic diagnosis for common build/test failure patterns.
+#[cfg(windows)]
 fn diagnose(output: &str, command: &str) -> Option<String> {
     let out_lower = output.to_lowercase();
     let cmd_lower = command.to_lowercase();
@@ -263,7 +495,7 @@ fn diagnose(output: &str, command: &str) -> Option<String> {
     // Generic
     if out_lower.contains("permission denied") || out_lower.contains("access is denied") {
         return Some(
-            "Permission denied. Try running with elevated privileges or check file ownership."
+            "Permission denied. Check workspace access and the sandbox capability; elevated execution is unavailable."
                 .to_string(),
         );
     }
@@ -277,20 +509,111 @@ fn diagnose(output: &str, command: &str) -> Option<String> {
     None
 }
 
-#[cfg(target_os = "windows")]
-fn build_cmd(command: &str) -> Command {
-    // Use cmd.exe so PATH-based tools (cargo, python, npm, git) resolve correctly
-    // without needing PowerShell profile overhead. `tokio_command` applies
-    // CREATE_NO_WINDOW to suppress the console-window flash.
-    let full = format!("chcp 65001 >nul 2>&1 & {}", command);
-    let mut c = tokio_command("cmd");
-    c.args(["/C", &full]);
-    c
+fn recovery_operation_id(ctx: &ToolContext) -> String {
+    ctx.tool_use_id
+        .clone()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
 }
 
-#[cfg(not(target_os = "windows"))]
-fn build_cmd(command: &str) -> Command {
-    let mut c = tokio_command("sh");
-    c.args(["-c", command]);
-    c
+fn recovery_error(
+    content: impl Into<String>,
+    ctx: &ToolContext,
+    launched: bool,
+) -> Result<ToolResult> {
+    use crate::tool_recovery::RecoveryReport;
+    let report = if launched {
+        RecoveryReport::unknown_failure(recovery_operation_id(ctx))
+    } else {
+        RecoveryReport::refused_before_launch(recovery_operation_id(ctx))
+    }
+    .map_err(anyhow::Error::msg)?;
+    report
+        .attach(ToolResult::err(content))
+        .map_err(anyhow::Error::msg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn code_run_discloses_supported_os_sandbox_boundary() {
+        let tool = CodeRunTool::default();
+        let description = tool.description();
+        if cfg!(windows) {
+            assert!(description.contains("Windows AppContainer"));
+            assert!(description.contains("security level in Settings"));
+            assert!(description.contains("sandbox disabled"));
+        } else {
+            assert!(description.contains("Commands are not executed"));
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn code_run_uses_appcontainer_and_rejects_out_of_workspace_cwd() {
+        use crate::agent::tool::ToolSettings;
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+
+        let temp = tempfile::tempdir().expect("create tool workspace");
+        let workspace = temp.path().join("workspace");
+        let outside_file = temp.path().join("outside-secret.txt");
+        std::fs::create_dir_all(&workspace).expect("create tool workspace root");
+        std::fs::write(&outside_file, "must-not-leak-code-run").expect("write outside canary");
+        let ctx = ToolContext {
+            session_id: "code-run-appcontainer-test".into(),
+            workspace_root: workspace,
+            bypass_permissions: false,
+            settings: Arc::new(ToolSettings {
+                sandbox_mode: crate::agent::tool::SandboxMode::Isolated,
+                ..ToolSettings::default()
+            }),
+            max_iterations: None,
+            memory_owner_id: "test".into(),
+            pool_session_id: None,
+            tool_use_id: None,
+            cancel: Arc::new(AtomicBool::new(false)),
+            loop_halt: None,
+        };
+        let result = CodeRunTool::default()
+            .call(
+                json!({"command": "echo code-run-appcontainer", "timeout_secs": 10}),
+                &ctx,
+            )
+            .await
+            .expect("call code_run");
+        assert!(!result.is_error, "{}", result.content);
+        assert!(result.content.contains("code-run-appcontainer"));
+        assert!(result.content.contains("\"outcome\":\"completed\""));
+        assert!(result
+            .content
+            .contains("\"termination\":\"tree_terminated\""));
+
+        let outside_read = format!("type \"{}\"", outside_file.display());
+        let result = CodeRunTool::default()
+            .call(json!({"command": outside_read, "timeout_secs": 10}), &ctx)
+            .await
+            .expect("call code_run with out-of-scope file read");
+        assert!(result.is_error, "{}", result.content);
+        assert!(
+            result.content.contains("exit_code: 1 (FAILED)"),
+            "{}",
+            result.content
+        );
+        assert!(!result.content.contains("must-not-leak-code-run"));
+        assert!(result.content.contains("\"outcome\":\"tool_failed\""));
+
+        let outside = temp.path().to_string_lossy().to_string();
+        let result = CodeRunTool::default()
+            .call(
+                json!({"command": "echo must-not-run", "cwd": outside}),
+                &ctx,
+            )
+            .await
+            .expect("call code_run with out-of-scope cwd");
+        assert!(result.is_error);
+        assert!(result.content.contains("inside workspace_root"));
+        assert!(result.content.contains("\"termination\":\"not_started\""));
+    }
 }

@@ -221,6 +221,7 @@ async fn run_one_turn(state: &mut ReplState, prompt: &str) -> Result<(), String>
         pool_event_sink: Some(interactive_sink.clone()),
         subagent_runtime: None,
         coordinator_config: Default::default(),
+        background_registry: None,
     };
     piscis_kernel::tools::register_neutral_tools(&mut handle, &neutral_cfg);
     host.host_tools().register(&mut handle);

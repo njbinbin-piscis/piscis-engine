@@ -15,6 +15,7 @@ pub mod rule_preprocess;
 pub mod state_frame;
 pub mod summary_worker;
 pub mod tool;
+pub mod tool_completion;
 pub mod tool_receipt;
 pub mod vision;
 

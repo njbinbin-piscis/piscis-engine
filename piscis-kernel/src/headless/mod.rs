@@ -113,6 +113,7 @@ pub fn register_default_cli_tools(
         pool_event_sink: None,
         subagent_runtime: None,
         coordinator_config: Default::default(),
+        background_registry: Some(crate::background::shared_default_registry()),
     };
     crate::tools::register_neutral_tools(handle, &cfg);
 }
@@ -456,6 +457,7 @@ fn default_headless_system_prompt(
          - Prefer `file_list` / `file_read` / `file_search` to explore the workspace.\n\
          - Use `file_write` and `file_edit` for changes; `file_diff` to preview edits.\n\
          - Use `shell` for commands and `code_run` for build / test flows.\n\
+         - These child processes run as the current OS user without OS-level containment; file-tool workspace restrictions do not constrain shell or code_run.\n\
          - Keep replies concise. Stop as soon as the requested task is done.\n"
     );
     if let Some(extra) = extras {
@@ -464,4 +466,19 @@ fn default_headless_system_prompt(
         body.push('\n');
     }
     body
+}
+
+#[cfg(test)]
+mod sandbox_disclosure_tests {
+    use super::default_headless_system_prompt;
+
+    #[test]
+    fn headless_prompt_distinguishes_file_scope_from_process_containment() {
+        let prompt = default_headless_system_prompt("C:/workspace", false, None);
+        assert!(prompt.contains("file operations are restricted to this directory"));
+        assert!(
+            prompt.contains("file-tool workspace restrictions do not constrain shell or code_run")
+        );
+        assert!(prompt.contains("without OS-level containment"));
+    }
 }

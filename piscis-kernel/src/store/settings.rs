@@ -65,6 +65,9 @@ pub struct LlmProviderConfig {
     /// Max output tokens; 0 means inherit from global settings
     #[serde(default)]
     pub max_tokens: u32,
+    /// Context window in tokens; 0 means inherit from global settings
+    #[serde(default)]
+    pub context_window: u32,
     /// Sampling temperature; None = provider default.
     #[serde(default)]
     pub temperature: Option<f32>,
@@ -79,6 +82,20 @@ pub struct LlmProviderConfig {
     pub stream: Option<bool>,
 }
 
+/// List price of one model, per million tokens, in `currency`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ModelPrice {
+    pub provider: String,
+    pub model: String,
+    #[serde(default)]
+    pub input_per_million: f64,
+    #[serde(default)]
+    pub output_per_million: f64,
+    /// ISO 4217 code such as "USD" or "CNY"; empty means USD.
+    #[serde(default)]
+    pub currency: String,
+}
+
 impl Default for LlmProviderConfig {
     fn default() -> Self {
         Self {
@@ -89,6 +106,7 @@ impl Default for LlmProviderConfig {
             api_key: String::new(),
             base_url: String::new(),
             max_tokens: 0,
+            context_window: 0,
             temperature: None,
             top_p: None,
             thinking: None,
@@ -300,6 +318,9 @@ pub struct Settings {
     /// Whether to show permission dialogs for file writes
     #[serde(default = "default_true")]
     pub confirm_file_writes: bool,
+    /// Tool names permanently auto-approved by user (e.g. ["shell", "code_run"] or ["*"])
+    #[serde(default)]
+    pub always_allow_tools: Vec<String>,
     /// Run browser in headless mode (invisible). false = user can see the browser window.
     #[serde(default = "default_true")]
     pub browser_headless: bool,
@@ -475,6 +496,12 @@ pub struct Settings {
     /// Maximum tool-call iterations per agent run (default 50)
     #[serde(default = "default_max_iterations")]
     pub max_iterations: u32,
+    /// Sub-agent iteration cap; 0 = half of `max_iterations`.
+    #[serde(default)]
+    pub subagent_max_iterations: u32,
+    /// Sub-agent wall-clock timeout in seconds; 0 = built-in default.
+    #[serde(default)]
+    pub subagent_timeout_secs: u32,
     /// Cumulative-input-tokens cap after which an auto summary/compaction
     /// kicks in. Set to 0 to disable.
     ///
@@ -584,6 +611,11 @@ pub struct Settings {
     /// When a Koi has no provider assigned, the global provider/model/key is used.
     #[serde(default)]
     pub llm_providers: Vec<LlmProviderConfig>,
+
+    /// User-entered list prices per provider + model, used for cost display.
+    /// Empty means no price is known and no cost is shown.
+    #[serde(default)]
+    pub model_prices: Vec<ModelPrice>,
 
     // ── Runtime Paths ───────────────────────────────────────────────────────
     /// User-specified executable paths for runtimes not found on PATH.
@@ -798,6 +830,7 @@ impl Default for Settings {
             model_runtime_profiles: HashMap::new(),
             confirm_shell_commands: true,
             confirm_file_writes: true,
+            always_allow_tools: Vec::new(),
             browser_headless: true,
             policy_mode: default_policy_mode(),
             tool_rate_limit_per_minute: default_tool_rate_limit(),
@@ -847,6 +880,8 @@ impl Default for Settings {
             smtp_from_name: String::new(),
             email_enabled: false,
             max_iterations: default_max_iterations(),
+            subagent_max_iterations: 0,
+            subagent_timeout_secs: 0,
             auto_compact_input_tokens_threshold: default_auto_compact_input_tokens_threshold(),
             compaction_micro_percent: default_compaction_micro_percent(),
             compaction_auto_percent: default_compaction_auto_percent(),
@@ -868,6 +903,7 @@ impl Default for Settings {
             mcp_servers: Vec::new(),
             ssh_servers: Vec::new(),
             llm_providers: Vec::new(),
+            model_prices: Vec::new(),
             runtime_paths: HashMap::new(),
             vision_enabled: false,
             vision_use_main_llm: true,
@@ -889,125 +925,189 @@ impl Default for Settings {
 
 impl Settings {
     pub fn load(path: &Path) -> Result<Self> {
+        let mut strict_secrets = false;
+        let mut mcp_secrets_encrypted = false;
         let mut settings = if path.exists() {
             let content = std::fs::read_to_string(path)?;
-            match serde_json::from_str::<Settings>(&content) {
-                Ok(s) => s,
-                Err(e) => {
-                    // Log the parse error and keep the broken file as a backup
-                    tracing::error!(
-                        "Failed to parse settings file at '{}': {}. \
-                         Falling back to defaults. Original file preserved.",
-                        path.display(),
-                        e
+            let value: serde_json::Value = serde_json::from_str(&content)?;
+            if let Some(version) = value.get("agentz_secret_format") {
+                if !matches!(version.as_u64(), Some(1) | Some(2)) {
+                    anyhow::bail!(
+                        "Unsupported settings secret format; compatible recovery is required"
                     );
-                    // Rename broken file so it isn't overwritten silently
-                    let backup = path.with_extension("json.bak");
-                    let _ = std::fs::copy(path, &backup);
-                    Settings::default()
                 }
+                strict_secrets = true;
+                mcp_secrets_encrypted = version.as_u64() == Some(2);
             }
+            serde_json::from_value::<Settings>(value)?
         } else {
             Settings::default()
         };
         settings.config_path = path.to_path_buf();
 
+        if strict_secrets
+            && !path
+                .parent()
+                .is_some_and(|parent| parent.join(".secret_key").is_file())
+        {
+            anyhow::bail!("Protected settings key is missing; compatible recovery is required");
+        }
+
         // Decrypt API keys (hex-encoded ciphertext on disk).
         // If decryption fails the value is likely still plaintext (pre-migration);
         // keep it as-is and the next save() will encrypt it.
-        if let Some(store) = Self::secret_store(path) {
-            Self::try_decrypt_field(&store, &mut settings.anthropic_api_key);
-            Self::try_decrypt_field(&store, &mut settings.openai_api_key);
-            Self::try_decrypt_field(&store, &mut settings.deepseek_api_key);
-            Self::try_decrypt_field(&store, &mut settings.qwen_api_key);
-            Self::try_decrypt_field(&store, &mut settings.minimax_api_key);
-            Self::try_decrypt_field(&store, &mut settings.zhipu_api_key);
-            Self::try_decrypt_field(&store, &mut settings.kimi_api_key);
-            Self::try_decrypt_field(&store, &mut settings.feishu_app_secret);
-            Self::try_decrypt_field(&store, &mut settings.wecom_bot_secret);
-            Self::try_decrypt_field(&store, &mut settings.dingtalk_app_secret);
-            Self::try_decrypt_field(&store, &mut settings.dingtalk_robot_code);
-            Self::try_decrypt_field(&store, &mut settings.telegram_bot_token);
-            Self::try_decrypt_field(&store, &mut settings.matrix_access_token);
-            Self::try_decrypt_field(&store, &mut settings.webhook_auth_token);
-            Self::try_decrypt_field(&store, &mut settings.wechat_gateway_token);
-            Self::try_decrypt_field(&store, &mut settings.wechat_bot_token);
-            Self::try_decrypt_field(&store, &mut settings.smtp_password);
+        {
+            let store = Self::secret_store(path)?;
+            Self::try_decrypt_field(&store, &mut settings.anthropic_api_key, strict_secrets)?;
+            Self::try_decrypt_field(&store, &mut settings.openai_api_key, strict_secrets)?;
+            Self::try_decrypt_field(&store, &mut settings.deepseek_api_key, strict_secrets)?;
+            Self::try_decrypt_field(&store, &mut settings.qwen_api_key, strict_secrets)?;
+            Self::try_decrypt_field(&store, &mut settings.minimax_api_key, strict_secrets)?;
+            Self::try_decrypt_field(&store, &mut settings.zhipu_api_key, strict_secrets)?;
+            Self::try_decrypt_field(&store, &mut settings.kimi_api_key, strict_secrets)?;
+            Self::try_decrypt_field(&store, &mut settings.feishu_app_secret, strict_secrets)?;
+            Self::try_decrypt_field(&store, &mut settings.wecom_bot_secret, strict_secrets)?;
+            Self::try_decrypt_field(&store, &mut settings.dingtalk_app_secret, strict_secrets)?;
+            Self::try_decrypt_field(&store, &mut settings.dingtalk_robot_code, strict_secrets)?;
+            Self::try_decrypt_field(&store, &mut settings.telegram_bot_token, strict_secrets)?;
+            Self::try_decrypt_field(&store, &mut settings.matrix_access_token, strict_secrets)?;
+            Self::try_decrypt_field(&store, &mut settings.webhook_auth_token, strict_secrets)?;
+            Self::try_decrypt_field(&store, &mut settings.wechat_gateway_token, strict_secrets)?;
+            Self::try_decrypt_field(&store, &mut settings.wechat_bot_token, strict_secrets)?;
+            Self::try_decrypt_field(&store, &mut settings.smtp_password, strict_secrets)?;
+            Self::try_decrypt_field(&store, &mut settings.vision_api_key, strict_secrets)?;
             // Decrypt SSH server credentials
             for srv in &mut settings.ssh_servers {
-                Self::try_decrypt_field(&store, &mut srv.password);
-                Self::try_decrypt_field(&store, &mut srv.private_key);
+                Self::try_decrypt_field(&store, &mut srv.password, strict_secrets)?;
+                Self::try_decrypt_field(&store, &mut srv.private_key, strict_secrets)?;
             }
             // Decrypt named LLM provider API keys
             for p in &mut settings.llm_providers {
-                Self::try_decrypt_field(&store, &mut p.api_key);
+                Self::try_decrypt_field(&store, &mut p.api_key, strict_secrets)?;
+            }
+            if mcp_secrets_encrypted {
+                for server in &mut settings.mcp_servers {
+                    Self::try_decrypt_field(&store, &mut server.command, true)?;
+                    Self::try_decrypt_field(&store, &mut server.url, true)?;
+                    for arg in &mut server.args {
+                        Self::try_decrypt_field(&store, arg, true)?;
+                    }
+                    for value in server.env.values_mut().chain(server.headers.values_mut()) {
+                        Self::try_decrypt_field(&store, value, true)?;
+                    }
+                }
             }
         }
         Ok(settings)
     }
 
     pub fn save(&self) -> Result<()> {
+        self.save_with_encryptor(|store, value| store.encrypt_hex(value))
+    }
+
+    fn save_with_encryptor(
+        &self,
+        mut encrypt: impl FnMut(&crate::security::secrets::SecretStore, &str) -> Result<String>,
+    ) -> Result<()> {
         if let Some(parent) = self.config_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let mut clone = self.clone();
         // Encrypt secret fields before writing to disk
-        if let Some(store) = Self::secret_store(&self.config_path) {
-            Self::encrypt_field(&store, &mut clone.anthropic_api_key);
-            Self::encrypt_field(&store, &mut clone.openai_api_key);
-            Self::encrypt_field(&store, &mut clone.deepseek_api_key);
-            Self::encrypt_field(&store, &mut clone.qwen_api_key);
-            Self::encrypt_field(&store, &mut clone.minimax_api_key);
-            Self::encrypt_field(&store, &mut clone.zhipu_api_key);
-            Self::encrypt_field(&store, &mut clone.kimi_api_key);
-            Self::encrypt_field(&store, &mut clone.feishu_app_secret);
-            Self::encrypt_field(&store, &mut clone.wecom_bot_secret);
-            Self::encrypt_field(&store, &mut clone.dingtalk_app_secret);
-            Self::encrypt_field(&store, &mut clone.dingtalk_robot_code);
-            Self::encrypt_field(&store, &mut clone.telegram_bot_token);
-            Self::encrypt_field(&store, &mut clone.matrix_access_token);
-            Self::encrypt_field(&store, &mut clone.webhook_auth_token);
-            Self::encrypt_field(&store, &mut clone.wechat_gateway_token);
-            Self::encrypt_field(&store, &mut clone.wechat_bot_token);
-            Self::encrypt_field(&store, &mut clone.smtp_password);
+        let directory = self
+            .config_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("Settings require an explicit parent directory"))?;
+        let store = crate::security::secrets::SecretStore::new(directory)?;
+        {
+            Self::encrypt_field(&store, &mut clone.anthropic_api_key, &mut encrypt)?;
+            Self::encrypt_field(&store, &mut clone.openai_api_key, &mut encrypt)?;
+            Self::encrypt_field(&store, &mut clone.deepseek_api_key, &mut encrypt)?;
+            Self::encrypt_field(&store, &mut clone.qwen_api_key, &mut encrypt)?;
+            Self::encrypt_field(&store, &mut clone.minimax_api_key, &mut encrypt)?;
+            Self::encrypt_field(&store, &mut clone.zhipu_api_key, &mut encrypt)?;
+            Self::encrypt_field(&store, &mut clone.kimi_api_key, &mut encrypt)?;
+            Self::encrypt_field(&store, &mut clone.feishu_app_secret, &mut encrypt)?;
+            Self::encrypt_field(&store, &mut clone.wecom_bot_secret, &mut encrypt)?;
+            Self::encrypt_field(&store, &mut clone.dingtalk_app_secret, &mut encrypt)?;
+            Self::encrypt_field(&store, &mut clone.dingtalk_robot_code, &mut encrypt)?;
+            Self::encrypt_field(&store, &mut clone.telegram_bot_token, &mut encrypt)?;
+            Self::encrypt_field(&store, &mut clone.matrix_access_token, &mut encrypt)?;
+            Self::encrypt_field(&store, &mut clone.webhook_auth_token, &mut encrypt)?;
+            Self::encrypt_field(&store, &mut clone.wechat_gateway_token, &mut encrypt)?;
+            Self::encrypt_field(&store, &mut clone.wechat_bot_token, &mut encrypt)?;
+            Self::encrypt_field(&store, &mut clone.smtp_password, &mut encrypt)?;
+            Self::encrypt_field(&store, &mut clone.vision_api_key, &mut encrypt)?;
             // Encrypt SSH server credentials
             for srv in &mut clone.ssh_servers {
-                Self::encrypt_field(&store, &mut srv.password);
-                Self::encrypt_field(&store, &mut srv.private_key);
+                Self::encrypt_field(&store, &mut srv.password, &mut encrypt)?;
+                Self::encrypt_field(&store, &mut srv.private_key, &mut encrypt)?;
             }
             // Encrypt named LLM provider API keys
             for p in &mut clone.llm_providers {
-                Self::encrypt_field(&store, &mut p.api_key);
+                Self::encrypt_field(&store, &mut p.api_key, &mut encrypt)?;
+            }
+            for server in &mut clone.mcp_servers {
+                Self::encrypt_field(&store, &mut server.command, &mut encrypt)?;
+                Self::encrypt_field(&store, &mut server.url, &mut encrypt)?;
+                for arg in &mut server.args {
+                    Self::encrypt_field(&store, arg, &mut encrypt)?;
+                }
+                for value in server.env.values_mut().chain(server.headers.values_mut()) {
+                    Self::encrypt_field(&store, value, &mut encrypt)?;
+                }
             }
         }
-        let json = serde_json::to_string_pretty(&clone)?;
-        std::fs::write(&self.config_path, json)?;
+        let mut value = serde_json::to_value(&clone)?;
+        value["agentz_secret_format"] = serde_json::json!(2);
+        let json = serde_json::to_string_pretty(&value)?;
+        // Same-directory atomic replacement: failure leaves the old config intact.
+        use std::io::Write;
+        let mut file = tempfile::NamedTempFile::new_in(directory)?;
+        file.write_all(json.as_bytes())?;
+        file.as_file().sync_all()?;
+        file.persist(&self.config_path)
+            .map_err(|error| error.error)?;
         Ok(())
     }
 
-    fn secret_store(config_path: &Path) -> Option<crate::security::secrets::SecretStore> {
-        config_path
+    fn secret_store(config_path: &Path) -> Result<crate::security::secrets::SecretStore> {
+        let directory = config_path
             .parent()
-            .and_then(|dir| crate::security::secrets::SecretStore::new(dir).ok())
+            .filter(|path| !path.as_os_str().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("Settings require an explicit parent directory"))?;
+        crate::security::secrets::SecretStore::new(directory)
     }
 
-    fn encrypt_field(store: &crate::security::secrets::SecretStore, field: &mut String) {
-        if field.is_empty() {
-            return;
+    fn encrypt_field(
+        store: &crate::security::secrets::SecretStore,
+        field: &mut String,
+        encrypt: &mut impl FnMut(&crate::security::secrets::SecretStore, &str) -> Result<String>,
+    ) -> Result<()> {
+        if !field.is_empty() {
+            *field = encrypt(store, field)?;
         }
-        if let Ok(encrypted) = store.encrypt_hex(field) {
-            *field = encrypted;
-        }
+        Ok(())
     }
 
-    fn try_decrypt_field(store: &crate::security::secrets::SecretStore, field: &mut String) {
+    fn try_decrypt_field(
+        store: &crate::security::secrets::SecretStore,
+        field: &mut String,
+        strict: bool,
+    ) -> Result<()> {
         if field.is_empty() {
-            return;
+            return Ok(());
         }
-        if let Ok(decrypted) = store.decrypt_hex(field) {
-            *field = decrypted;
+        match store.decrypt_hex(field) {
+            Ok(decrypted) => *field = decrypted,
+            Err(_) if strict => anyhow::bail!(
+                "Cannot decrypt settings credential; compatible key recovery is required"
+            ),
+            Err(_) => {}
         }
-        // If decrypt fails, the field is probably still plaintext (legacy) — keep as-is
+        // Untagged legacy configurations can contain plaintext fields.
+        Ok(())
     }
 
     /// Returns true if at least one API key is configured
@@ -1099,5 +1199,237 @@ mod tests {
         assert_eq!(profile.context_window, 128_000);
         assert_eq!(profile.max_output_tokens, 16_384);
         assert_eq!(profile.supported_endpoint_types, ["chat", "image"]);
+    }
+    fn fixture() -> (tempfile::TempDir, Settings) {
+        let directory = tempfile::tempdir().unwrap();
+        let settings = Settings {
+            config_path: directory.path().join("config.json"),
+            openai_api_key: "fixture-secret-never-plaintext".into(),
+            vision_api_key: "fixture-vision-secret".into(),
+            ..Settings::default()
+        };
+        (directory, settings)
+    }
+
+    #[test]
+    fn secrets_save_roundtrips_and_atomically_replaces_existing_config() {
+        let (directory, mut settings) = fixture();
+        settings.save().unwrap();
+        settings.openai_api_key = "replacement-fixture-secret".into();
+        settings.save().unwrap();
+        let raw = std::fs::read_to_string(&settings.config_path).unwrap();
+        assert!(!raw.contains("replacement-fixture-secret"));
+        assert!(!raw.contains("fixture-vision-secret"));
+        let loaded = Settings::load(&settings.config_path).unwrap();
+        assert_eq!(loaded.openai_api_key, settings.openai_api_key);
+        assert_eq!(loaded.vision_api_key, settings.vision_api_key);
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn secrets_corrupted_key_preserves_old_config() {
+        let (directory, settings) = fixture();
+        settings.save().unwrap();
+        let original = std::fs::read(&settings.config_path).unwrap();
+        std::fs::write(directory.path().join(".secret_key"), b"damaged").unwrap();
+        assert!(settings.save().is_err());
+        assert_eq!(std::fs::read(&settings.config_path).unwrap(), original);
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn secrets_protected_load_failure_preserves_config_and_does_not_generate_a_key() {
+        let (directory, settings) = fixture();
+        settings.save().unwrap();
+        let original = std::fs::read(&settings.config_path).unwrap();
+        let key_path = directory.path().join(".secret_key");
+        let protected_key = std::fs::read(&key_path).unwrap();
+        std::fs::remove_file(&key_path).unwrap();
+        assert!(Settings::load(&settings.config_path).is_err());
+        assert!(!key_path.exists());
+        std::fs::write(&key_path, &protected_key).unwrap();
+        let mut invalid_config: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        invalid_config["openai_api_key"] = serde_json::json!("corrupted-ciphertext");
+        let damaged = serde_json::to_vec(&invalid_config).unwrap();
+        std::fs::write(&settings.config_path, &damaged).unwrap();
+        assert!(Settings::load(&settings.config_path).is_err());
+        assert_eq!(std::fs::read(&settings.config_path).unwrap(), damaged);
+        std::fs::write(&settings.config_path, &original).unwrap();
+        assert_eq!(
+            Settings::load(&settings.config_path)
+                .unwrap()
+                .openai_api_key,
+            settings.openai_api_key
+        );
+    }
+
+    #[test]
+    fn secrets_legacy_config_migrates_without_changing_ciphertext() {
+        let (directory, settings) = fixture();
+        let store = crate::security::secrets::SecretStore::new(directory.path()).unwrap();
+        let mut legacy = serde_json::to_value(&settings).unwrap();
+        legacy["openai_api_key"] =
+            serde_json::json!(store.encrypt_hex(&settings.openai_api_key).unwrap());
+        legacy["vision_api_key"] = serde_json::json!(settings.vision_api_key.clone());
+        let original = serde_json::to_vec(&legacy).unwrap();
+        std::fs::write(&settings.config_path, &original).unwrap();
+        let loaded = Settings::load(&settings.config_path).unwrap();
+        assert_eq!(loaded.openai_api_key, settings.openai_api_key);
+        assert_eq!(loaded.vision_api_key, settings.vision_api_key);
+        assert_eq!(std::fs::read(&settings.config_path).unwrap(), original);
+        loaded.save().unwrap();
+        let migrated: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&settings.config_path).unwrap()).unwrap();
+        assert_eq!(migrated["agentz_secret_format"], 2);
+        assert_eq!(
+            Settings::load(&settings.config_path)
+                .unwrap()
+                .vision_api_key,
+            settings.vision_api_key
+        );
+    }
+
+    #[test]
+    fn secrets_encryption_failure_after_first_field_preserves_old_config() {
+        let (directory, settings) = fixture();
+        settings.save().unwrap();
+        let original = std::fs::read(&settings.config_path).unwrap();
+        let mut calls = 0;
+        let result = settings.save_with_encryptor(|store, value| {
+            calls += 1;
+            if calls == 2 {
+                anyhow::bail!("Injected nonce/random-source failure");
+            }
+            store.encrypt_hex(value)
+        });
+        assert!(result.is_err());
+        assert_eq!(calls, 2);
+        assert_eq!(std::fs::read(&settings.config_path).unwrap(), original);
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 2);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn secrets_locked_config_preserves_old_bytes_and_cleans_temp_file() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let (directory, settings) = fixture();
+        settings.save().unwrap();
+        let original = std::fs::read(&settings.config_path).unwrap();
+        let locked = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .open(&settings.config_path)
+            .unwrap();
+        assert!(settings.save().is_err());
+        assert_eq!(std::fs::read(&settings.config_path).unwrap(), original);
+        drop(locked);
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 2);
+    }
+    #[test]
+    fn secrets_unreadable_key_path_preserves_old_config() {
+        let (directory, settings) = fixture();
+        std::fs::write(&settings.config_path, b"previous-config-bytes").unwrap();
+        std::fs::create_dir(directory.path().join(".secret_key")).unwrap();
+        assert!(settings.save().is_err());
+        assert_eq!(
+            std::fs::read(&settings.config_path).unwrap(),
+            b"previous-config-bytes"
+        );
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 2);
+    }
+    #[test]
+    fn secrets_nested_credentials_are_encrypted_and_failure_does_not_partially_save() {
+        let (directory, mut settings) = fixture();
+        settings.ssh_servers.push(SshServerConfig {
+            password: "fixture-ssh-password".into(),
+            private_key: "fixture-ssh-private-key".into(),
+            ..SshServerConfig::default()
+        });
+        settings.llm_providers.push(LlmProviderConfig {
+            api_key: "fixture-provider-api-key".into(),
+            ..LlmProviderConfig::default()
+        });
+        settings.save().unwrap();
+        let original = std::fs::read(&settings.config_path).unwrap();
+        let raw = String::from_utf8(original.clone()).unwrap();
+        for secret in [
+            "fixture-ssh-password",
+            "fixture-ssh-private-key",
+            "fixture-provider-api-key",
+        ] {
+            assert!(!raw.contains(secret));
+        }
+        let loaded = Settings::load(&settings.config_path).unwrap();
+        assert_eq!(
+            loaded.ssh_servers[0].password,
+            settings.ssh_servers[0].password
+        );
+        assert_eq!(
+            loaded.ssh_servers[0].private_key,
+            settings.ssh_servers[0].private_key
+        );
+        assert_eq!(
+            loaded.llm_providers[0].api_key,
+            settings.llm_providers[0].api_key
+        );
+        assert!(settings
+            .save_with_encryptor(|store, value| {
+                if value == "fixture-provider-api-key" {
+                    anyhow::bail!("Injected final nested credential failure");
+                }
+                store.encrypt_hex(value)
+            })
+            .is_err());
+        assert_eq!(std::fs::read(&settings.config_path).unwrap(), original);
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn mcp_values_migrate_from_v1_plaintext_to_v2_encrypted() {
+        let (_directory, mut settings) = fixture();
+        settings.mcp_servers.push(McpServerConfig {
+            name: "fixture".into(),
+            command: "az-mcp-command-marker".into(),
+            args: vec!["az-mcp-arg-marker".into()],
+            url: "az-mcp-url-marker".into(),
+            env: HashMap::from([("CUSTOM".into(), "az-mcp-env-marker".into())]),
+            headers: HashMap::from([("Authorization".into(), "az-mcp-header-marker".into())]),
+            ..McpServerConfig::default()
+        });
+        settings.save().unwrap();
+        let mut v1: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&settings.config_path).unwrap()).unwrap();
+        v1["agentz_secret_format"] = serde_json::json!(1);
+        v1["mcp_servers"] = serde_json::to_value(&settings.mcp_servers).unwrap();
+        std::fs::write(&settings.config_path, serde_json::to_vec(&v1).unwrap()).unwrap();
+        let migrated = Settings::load(&settings.config_path).unwrap();
+        assert_eq!(migrated.mcp_servers[0].env["CUSTOM"], "az-mcp-env-marker");
+        migrated.save().unwrap();
+        let raw = std::fs::read_to_string(&settings.config_path).unwrap();
+        for marker in [
+            "az-mcp-command-marker",
+            "az-mcp-arg-marker",
+            "az-mcp-url-marker",
+            "az-mcp-env-marker",
+            "az-mcp-header-marker",
+        ] {
+            assert!(!raw.contains(marker));
+        }
+        let loaded = Settings::load(&settings.config_path).unwrap();
+        assert_eq!(
+            loaded.mcp_servers[0].command,
+            settings.mcp_servers[0].command
+        );
+        assert_eq!(loaded.mcp_servers[0].args, settings.mcp_servers[0].args);
+        assert_eq!(loaded.mcp_servers[0].url, settings.mcp_servers[0].url);
+        assert_eq!(loaded.mcp_servers[0].env, settings.mcp_servers[0].env);
+        assert_eq!(
+            loaded.mcp_servers[0].headers,
+            settings.mcp_servers[0].headers
+        );
+        let mut damaged: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        damaged["mcp_servers"][0]["env"]["CUSTOM"] = serde_json::json!("broken-ciphertext");
+        std::fs::write(&settings.config_path, serde_json::to_vec(&damaged).unwrap()).unwrap();
+        assert!(Settings::load(&settings.config_path).is_err());
     }
 }

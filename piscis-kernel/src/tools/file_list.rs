@@ -1,6 +1,7 @@
 /// File list tool — structured directory listing returned as JSON.
 /// Unlike `shell cmd dir`, this returns machine-readable structured data the LLM can parse directly.
 use crate::agent::tool::{Tool, ToolContext, ToolResult};
+use crate::path_text::{display_path, display_path_under, os_text};
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -76,13 +77,13 @@ impl Tool for FileListTool {
         if !path.exists() {
             return Ok(ToolResult::err(format!(
                 "Path does not exist: {}",
-                path.display()
+                display_path(&path)
             )));
         }
         if !path.is_dir() {
             return Ok(ToolResult::err(format!(
                 "Not a directory: {}",
-                path.display()
+                display_path(&path)
             )));
         }
 
@@ -92,6 +93,7 @@ impl Tool for FileListTool {
         let dirs_only = input["dirs_only"].as_bool().unwrap_or(false);
 
         let mut entries: Vec<Value> = Vec::new();
+        let mut read_error: Option<String> = None;
         collect_entries(
             &path,
             &path,
@@ -100,12 +102,25 @@ impl Tool for FileListTool {
             include_hidden,
             dirs_only,
             &mut entries,
+            &mut read_error,
         );
 
         if entries.is_empty() {
+            if let Some(error) = read_error {
+                return Ok(ToolResult::err(format!(
+                    "Failed to list {}: {error}",
+                    display_path(&path)
+                )));
+            }
+            if dirs_only {
+                return Ok(ToolResult::ok(format!(
+                    "无子目录（文件数未知）: {}",
+                    display_path(&path)
+                )));
+            }
             return Ok(ToolResult::ok(format!(
                 "Directory is empty: {}",
-                path.display()
+                display_path(&path)
             )));
         }
 
@@ -118,7 +133,7 @@ impl Tool for FileListTool {
         };
 
         let result = json!({
-            "path": path.display().to_string(),
+            "path": display_path(&path),
             "total_entries": total,
             "truncated": truncated,
             "entries": entries
@@ -138,6 +153,7 @@ fn collect_entries(
     include_hidden: bool,
     dirs_only: bool,
     out: &mut Vec<Value>,
+    read_error: &mut Option<String>,
 ) {
     if out.len() >= MAX_ENTRIES {
         return;
@@ -145,7 +161,12 @@ fn collect_entries(
 
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
-        Err(_) => return,
+        Err(error) => {
+            if depth == 0 {
+                *read_error = Some(error.to_string());
+            }
+            return;
+        }
     };
 
     let mut sorted: Vec<_> = entries.flatten().collect();
@@ -166,16 +187,21 @@ fn collect_entries(
         }
 
         let path = entry.path();
-        let name = entry.file_name().to_string_lossy().to_string();
+        let name = os_text(&entry.file_name());
 
         // Skip hidden files unless requested
         if !include_hidden && name.starts_with('.') {
             continue;
         }
 
-        let is_dir = path.is_dir();
+        // DirEntry already carries the find-data attributes. A second
+        // metadata call can fail on cloud placeholders and long names, which
+        // made real directories look like files and then disappear under dirs_only.
+        let is_dir = entry
+            .file_type()
+            .map(|kind| kind.is_dir())
+            .unwrap_or_else(|_| path.is_dir());
 
-        // Skip files if dirs_only
         if dirs_only && !is_dir {
             continue;
         }
@@ -196,13 +222,10 @@ fn collect_entries(
                 dt.format("%Y-%m-%d %H:%M").to_string()
             });
 
-        let rel_path = path.strip_prefix(root).unwrap_or(&path);
-        let rel_str = rel_path.to_string_lossy().replace('\\', "/");
-
         let mut entry_json = json!({
             "name": name,
-            "path": path.display().to_string(),
-            "relative_path": rel_str,
+            "path": display_path(&path),
+            "relative_path": display_path_under(&path, root),
             "type": if is_dir { "directory" } else { "file" },
         });
 
@@ -232,9 +255,66 @@ fn collect_entries(
                     include_hidden,
                     dirs_only,
                     out,
+                    read_error,
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::tool::{Tool, ToolContext, ToolSettings};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+
+    fn ctx(root: &Path) -> ToolContext {
+        ToolContext {
+            session_id: "file-list".into(),
+            workspace_root: root.to_path_buf(),
+            bypass_permissions: false,
+            settings: Arc::new(ToolSettings::default()),
+            max_iterations: None,
+            memory_owner_id: "test".into(),
+            pool_session_id: None,
+            tool_use_id: None,
+            cancel: Arc::new(AtomicBool::new(false)),
+            loop_halt: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn dirs_only_names_unicode_files_instead_of_calling_the_directory_empty() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("表驱动项目二");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("协议台账.txt"), "x").unwrap();
+        let result = FileListTool
+            .call(
+                json!({ "path": "表驱动项目二", "dirs_only": true, "max_depth": 2 }),
+                &ctx(temp.path()),
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error, "{}", result.content);
+        assert!(result.content.contains("无子目录（文件数未知）"), "{}", result.content);
+        assert!(!result.content.contains("协议台账.txt"), "{}", result.content);
+        assert!(!result.content.contains("Directory is empty"), "{}", result.content);
+    }
+
+    #[tokio::test]
+    async fn unicode_file_is_listed() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("中文目录");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("中文文件.md"), "x").unwrap();
+        let result = FileListTool
+            .call(json!({ "path": "中文目录" }), &ctx(temp.path()))
+            .await
+            .unwrap();
+        assert!(!result.is_error, "{}", result.content);
+        assert!(result.content.contains("中文文件.md"), "{}", result.content);
     }
 }
 

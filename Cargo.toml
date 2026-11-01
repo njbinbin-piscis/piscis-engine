@@ -1,5 +1,6 @@
 [workspace]
 members = ["piscis-core", "piscis-kernel", "piscis-cli", "piscis-ide-tools"]
+exclude = ["vendor/secret-service"]
 resolver = "2"
 
 # Workspace-wide lint policy. `cargo clippy --workspace` will treat all of

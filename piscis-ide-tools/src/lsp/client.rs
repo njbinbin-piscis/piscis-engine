@@ -18,9 +18,11 @@ use tracing::{debug, warn};
 
 type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>;
 
+#[derive(Clone)]
 struct DocState {
     version: i32,
     text: String,
+    language_id: String,
 }
 
 struct DiagEntry {
@@ -51,7 +53,7 @@ impl LspClient {
         root: &str,
         language: &str,
     ) -> Result<Arc<Self>, String> {
-        let mut child = piscis_kernel::proc::tokio_command(command)
+        let child = piscis_kernel::proc::tokio_command(command)
             .args(args)
             .current_dir(root)
             .stdin(Stdio::piped())
@@ -60,6 +62,18 @@ impl LspClient {
             .kill_on_drop(true)
             .spawn()
             .map_err(|e| format!("failed to spawn '{command}': {e}"))?;
+        Self::attach(child, root, language, Some(std::process::id())).await
+    }
+
+    /// Handshake with an already spawned server whose stdio is piped (e.g. one
+    /// started on a remote host through ssh). `root` is the server-side path;
+    /// `process_id` is `None` when this process is not visible to the server.
+    pub async fn attach(
+        mut child: Child,
+        root: &str,
+        language: &str,
+        process_id: Option<u32>,
+    ) -> Result<Arc<Self>, String> {
         let stdin = child.stdin.take().ok_or("no stdin handle")?;
         let stdout = child.stdout.take().ok_or("no stdout handle")?;
         let stderr = child.stderr.take();
@@ -119,6 +133,8 @@ impl LspClient {
                 }
             }
             alive.store(false, Ordering::SeqCst);
+            diags.lock().await.clear();
+            diag_notify.notify_waiters();
             let mut p = pending.lock().await;
             for (_, tx) in p.drain() {
                 let _ = tx.send(Err("language server exited".into()));
@@ -127,7 +143,7 @@ impl LspClient {
 
         let root_uri = path_to_uri(root);
         let init = json!({
-            "processId": std::process::id(),
+            "processId": process_id,
             "rootUri": root_uri,
             "workspaceFolders": [{ "uri": root_uri, "name": "project" }],
             "capabilities": {
@@ -243,6 +259,15 @@ impl LspClient {
             (Some("textDocument/publishDiagnostics"), None) => {
                 if let Some(params) = msg.get("params") {
                     let uri = params.get("uri").and_then(|u| u.as_str()).unwrap_or("");
+                    if let Some(version) = params.get("version").and_then(Value::as_i64) {
+                        let docs = self.docs.lock().await;
+                        if docs
+                            .get(uri)
+                            .is_some_and(|doc| i64::from(doc.version) != version)
+                        {
+                            return;
+                        }
+                    }
                     let items = params
                         .get("diagnostics")
                         .and_then(|d| d.as_array())
@@ -283,7 +308,17 @@ impl LspClient {
             return Err("file too large (>4MB)".into());
         }
         let text = String::from_utf8_lossy(&raw).to_string();
-        let uri = path_to_uri(path);
+        self.sync_text(&path_to_uri(path), text, language_id).await
+    }
+
+    /// [`Self::sync_file`] for content read elsewhere (remote files).
+    pub async fn sync_text(
+        &self,
+        uri: &str,
+        text: String,
+        language_id: &str,
+    ) -> Result<(String, bool), String> {
+        let uri = uri.to_string();
         let mut docs = self.docs.lock().await;
         match docs.get_mut(&uri) {
             None => {
@@ -292,6 +327,7 @@ impl LspClient {
                     DocState {
                         version: 1,
                         text: text.clone(),
+                        language_id: language_id.into(),
                     },
                 );
                 drop(docs);
@@ -308,6 +344,7 @@ impl LspClient {
                 doc.version += 1;
                 doc.text = text.clone();
                 let version = doc.version;
+                self.diags.lock().await.remove(&uri);
                 drop(docs);
                 self.notify(
                     "textDocument/didChange",
@@ -323,6 +360,18 @@ impl LspClient {
         }
     }
 
+    /// Replay only document state, never diagnostic results, into a fresh process.
+    pub(crate) async fn restore_documents(&self, previous: &Self) -> Result<(), String> {
+        let documents = previous.docs.lock().await.clone();
+        for (uri, mut document) in documents {
+            document.version = 1;
+            self.notify("textDocument/didOpen", json!({"textDocument": {
+                "uri": uri, "languageId": document.language_id, "version": 1, "text": document.text
+            }})).await?;
+            self.docs.lock().await.insert(uri, document);
+        }
+        Ok(())
+    }
     /// Diagnostics for a synced document: waits for a fresh publish when the
     /// content changed, then falls back to a pull request.
     pub async fn diagnostics(
@@ -331,6 +380,10 @@ impl LspClient {
         content_changed: bool,
         wait: Duration,
     ) -> Vec<Value> {
+        if !self.is_alive() {
+            return Vec::new();
+        }
+        let document_version = self.docs.lock().await.get(uri).map(|doc| doc.version);
         let baseline = if content_changed {
             self.diag_gen.load(Ordering::SeqCst)
         } else {
@@ -343,7 +396,11 @@ impl LspClient {
                 let map = self.diags.lock().await;
                 if let Some(entry) = map.get(uri) {
                     if entry.generation > baseline {
-                        return entry.items.clone();
+                        return if self.is_alive() {
+                            entry.items.clone()
+                        } else {
+                            Vec::new()
+                        };
                     }
                 }
             }
@@ -362,10 +419,23 @@ impl LspClient {
             .await
         {
             if let Some(items) = res.get("items").and_then(|i| i.as_array()) {
-                return items.clone();
+                if self.docs.lock().await.get(uri).map(|doc| doc.version) != document_version {
+                    return Vec::new();
+                }
+                return if self.is_alive() {
+                    items.clone()
+                } else {
+                    Vec::new()
+                };
             }
         }
+        if self.docs.lock().await.get(uri).map(|doc| doc.version) != document_version {
+            return Vec::new();
+        }
         let map = self.diags.lock().await;
+        if !self.is_alive() {
+            return Vec::new();
+        }
         map.get(uri).map(|e| e.items.clone()).unwrap_or_default()
     }
 }
@@ -376,7 +446,10 @@ async fn read_message<R: tokio::io::AsyncBufRead + Unpin>(
     let mut content_len: Option<usize> = None;
     loop {
         let mut line = String::new();
-        let n = reader.read_line(&mut line).await.map_err(|e| e.to_string())?;
+        let n = reader
+            .read_line(&mut line)
+            .await
+            .map_err(|e| e.to_string())?;
         if n == 0 {
             return Ok(None);
         }
@@ -397,7 +470,10 @@ async fn read_message<R: tokio::io::AsyncBufRead + Unpin>(
     }
     let len = content_len.ok_or("missing Content-Length")?;
     let mut buf = vec![0u8; len];
-    reader.read_exact(&mut buf).await.map_err(|e| e.to_string())?;
+    reader
+        .read_exact(&mut buf)
+        .await
+        .map_err(|e| e.to_string())?;
     serde_json::from_slice(&buf)
         .map(Some)
         .map_err(|e| format!("invalid JSON from server: {e}"))
@@ -453,6 +529,131 @@ pub fn uri_to_path(uri: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    async fn live_recovery(language: &str, extension: &str, text: &str) {
+        struct Fixture(std::path::PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let fixture = Fixture(std::env::temp_dir().join(format!(
+            "agentz-lsp-recovery-{}-{nonce}",
+            std::process::id()
+        )));
+        std::fs::create_dir_all(fixture.0.join("src")).unwrap();
+        if language == "typescript" {
+            fn copy_tree(source: &std::path::Path, target: &std::path::Path) {
+                std::fs::create_dir_all(target).unwrap();
+                for entry in std::fs::read_dir(source).unwrap() {
+                    let entry = entry.unwrap();
+                    if entry.file_type().unwrap().is_dir() {
+                        copy_tree(&entry.path(), &target.join(entry.file_name()));
+                    } else {
+                        std::fs::copy(entry.path(), target.join(entry.file_name())).unwrap();
+                    }
+                }
+            }
+            let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../../node_modules/typescript");
+            copy_tree(&source, &fixture.0.join("node_modules/typescript"));
+        }
+        std::fs::write(
+            fixture.0.join("Cargo.toml"),
+            "[package]\nname='recovery_fixture'\nversion='0.1.0'\nedition='2021'\n",
+        )
+        .unwrap();
+        std::fs::write(
+            fixture.0.join("src/lib.rs"),
+            "pub fn recovery_marker() {}\n",
+        )
+        .unwrap();
+        let file = fixture.0.join(format!("src/fixture.{extension}"));
+        std::fs::write(&file, text).unwrap();
+        let root = fixture.0.to_string_lossy().to_string();
+        let file = file.to_string_lossy().to_string();
+        let manager = crate::lsp::manager::LspManager::new();
+        let first = manager.client(&root, language).await.unwrap();
+        let (uri, _) = first.sync_file(&file, language).await.unwrap();
+        let second_file = fixture
+            .0
+            .join(format!("src/secondary.{extension}"))
+            .to_string_lossy()
+            .to_string();
+        std::fs::write(&second_file, text).unwrap();
+        let (second_uri, _) = first.sync_file(&second_file, language).await.unwrap();
+        std::fs::write(&file, format!("{text}\n")).unwrap();
+        first.sync_file(&file, language).await.unwrap();
+        first.dispatch(json!({"method":"textDocument/publishDiagnostics","params":{"uri":uri,"version":1,"diagnostics":[{"message":"stale-version-fixture"}]}})).await;
+        assert!(
+            !first.diags.lock().await.get(&uri).is_some_and(|entry| entry
+                .items
+                .iter()
+                .any(|item| item["message"] == "stale-version-fixture"))
+        );
+        first.dispatch(json!({"method":"textDocument/publishDiagnostics","params":{"uri":uri,"diagnostics":[{"message":"old process marker"}]}})).await;
+        first._child.lock().await.kill().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while first.is_alive() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(first
+            .diagnostics(&uri, false, Duration::ZERO)
+            .await
+            .is_empty());
+        let next = manager.client(&root, language).await.unwrap();
+        assert!(!Arc::ptr_eq(&first, &next));
+        let (uri, opened) = next.sync_file(&file, language).await.unwrap();
+        assert!(
+            !opened,
+            "manager must replay the document before handing out the replacement"
+        );
+        let symbols = next
+            .request(
+                "textDocument/documentSymbol",
+                json!({"textDocument":{"uri":uri}}),
+                Duration::from_secs(60),
+            )
+            .await
+            .unwrap();
+        assert!(symbols.to_string().contains("recovery_marker"), "{symbols}");
+        let secondary = next
+            .request(
+                "textDocument/documentSymbol",
+                json!({"textDocument":{"uri":second_uri}}),
+                Duration::from_secs(60),
+            )
+            .await
+            .unwrap();
+        assert!(
+            secondary.to_string().contains("recovery_marker"),
+            "{secondary}"
+        );
+        drop(first);
+        drop(next);
+        manager.stop_all().await;
+    }
+    #[tokio::test]
+    #[ignore = "Requires installed real TypeScript server; kills only fixture-owned child"]
+    async fn live_recovery_typescript() {
+        live_recovery(
+            "typescript",
+            "ts",
+            "export function recovery_marker() { return 1; }\n",
+        )
+        .await;
+    }
+    #[tokio::test]
+    #[ignore = "Requires installed real rust-analyzer; kills only fixture-owned child"]
+    async fn live_recovery_rust() {
+        live_recovery("rust", "rs", "pub fn recovery_marker() {}\n").await;
+    }
 
     #[test]
     fn uri_round_trip_windows_and_unix() {
