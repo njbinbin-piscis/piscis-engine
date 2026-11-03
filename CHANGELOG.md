@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.8.73] - 2026-11-04
+
+### Fixed
+
+- **Tool guidance is usable on every platform.** `file_list` and `file_search` state that `path` is a directory. `code_run` does not suggest `pip install` when `python -m` was given a file path, and on Windows it recognizes PowerShell syntax. Those diagnosis helpers are compiled only for Windows and tests, so a Linux or macOS build no longer fails with dead-code errors. Command examples no longer assume a Windows drive letter.
+
 ## [0.8.63] - 2026-08-13
 
 OpenAI 兼容链路鲁棒性（`model_not_found` / 截断工具参数）整改，见项目内 "DimWork OpenAI 兼容性整改计划"。
