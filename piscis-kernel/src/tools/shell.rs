@@ -20,7 +20,7 @@ use std::{
 #[cfg(windows)]
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
 #[cfg(windows)]
-const MAX_TIMEOUT_SECS: u64 = 300;
+const MAX_TIMEOUT_SECS: u64 = 600;
 #[cfg(windows)]
 const MAX_OUTPUT_BYTES: usize = 200 * 1024;
 
@@ -143,7 +143,7 @@ impl Tool for ShellTool {
 
     fn description(&self) -> &str {
         #[cfg(windows)]
-        return "Execute a Windows shell command inside a Windows AppContainer with filesystem access limited to the selected workspace. Network and isolation follow the user's security level in Settings: strict = AppContainer with no network, balanced = run as the current user with network and cwd pinned to the workspace, dev = sandbox disabled (cwd may leave workspace_root). The working directory must be inside workspace_root unless the sandbox is disabled; by default it is workspace_root. Elevated execution and other platforms are unavailable. Setup or cleanup failures stop execution without an unsandboxed retry. Supports PowerShell, 32-bit PowerShell, and cmd.exe. Windows PowerShell 5.1 drops double quotes inside arguments passed to native programs (python, node, git): write them as \\\" (python -c 'print(\\\"x\\\")') or use code_run, whose cmd syntax passes quotes unchanged. In strict mode, cmd directory listings and PowerShell location/child-process commands fail because ancestors of the workspace are not listable, and cmd built-ins print non-ANSI characters as '?'; use PowerShell, file_list/file_search or .NET APIs instead.";
+        return "Execute a Windows shell command. Network and isolation follow the user's security level in Settings: strict = Windows AppContainer with no network and filesystem limited to the workspace; balanced = current user with network, working directory pinned inside the workspace; dev = sandbox disabled, current user, working directory may leave workspace_root. Elevated execution and other platforms are unavailable. Setup or cleanup failures stop execution without an unsandboxed retry. Supports PowerShell, 32-bit PowerShell, and cmd.exe. Windows PowerShell 5.1 reads a script file with no UTF-8 BOM using the Windows ANSI code page, so this host writes .ps1/.psm1/.psd1 with a UTF-8 BOM. PowerShell 5.1 also drops double quotes inside arguments passed to native programs (python, node, git): write them as \\\" (python -c 'print(\\\"x\\\")') or use code_run, whose cmd syntax passes quotes unchanged. In strict mode, cmd directory listings and PowerShell location/child-process commands fail because ancestors of the workspace are not listable, and cmd built-ins print non-ANSI characters as '?'; use PowerShell, file_list/file_search or .NET APIs instead.";
 
         #[cfg(not(windows))]
         return "Unavailable: this platform does not have an enabled operating-system command sandbox. Commands are not executed.";
@@ -179,7 +179,7 @@ impl Tool for ShellTool {
                 },
                 "timeout": {
                     "type": "integer",
-                    "description": "Foreground timeout in seconds (default 120, maximum 300). On timeout the still-running command is moved to the background registry instead of being killed."
+                    "description": "Foreground timeout in seconds (default 120, maximum 600). Aliases: timeout_secs, timeout_ms. On timeout the still-running command is moved to the background registry instead of being killed."
                 },
                 "background": {
                     "type": "boolean",
@@ -213,7 +213,7 @@ impl Tool for ShellTool {
 
     fn description_minimal(&self) -> Cow<'_, str> {
         #[cfg(windows)]
-        return Cow::Borrowed("Run a Windows shell command in an AppContainer scoped to workspace_root; network/isolation follow the Settings security level (strict/balanced/dev, dev disables the sandbox). cwd must remain inside that root unless the sandbox is disabled. elevated=true is refused; other platforms do not execute shell commands.");
+        return Cow::Borrowed("Run a Windows shell command. Security level in Settings: strict = Windows AppContainer with no network; balanced = current user, cwd pinned to workspace_root; dev = sandbox disabled. elevated=true is refused.");
 
         #[cfg(not(windows))]
         Cow::Borrowed("Unavailable: shell commands are not executed because an OS sandbox is unavailable on this platform.")
@@ -404,8 +404,13 @@ impl Tool for ShellTool {
                         .join(system_dir)
                         .join("WindowsPowerShell\\v1.0\\powershell.exe");
                     let compat_cmd = rewrite_powershell5_chain(command);
+                    // PS 5.1 turns native-command stderr (git progress, npm
+                    // notices) into a terminating NativeCommandError under
+                    // ErrorActionPreference=Stop, flipping a successful exit
+                    // code to 1. Keep Continue and propagate the real exit
+                    // code so failure detection stays exit-code based.
                     let full_command = format!(
-                        "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; $OutputEncoding=[System.Text.Encoding]::UTF8; {compat_cmd}"
+                        "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; $OutputEncoding=[System.Text.Encoding]::UTF8; $ErrorActionPreference='Continue'; {compat_cmd}; exit $LASTEXITCODE"
                     );
                     (
                         program,
@@ -426,8 +431,13 @@ impl Tool for ShellTool {
                 }
             };
 
+            // Accept the loop-level aliases too: callers that pass
+            // `timeout_secs` / `timeout_ms` must not silently fall back to the
+            // 120s default while the loop waits much longer.
             let timeout_secs = input["timeout"]
                 .as_u64()
+                .or_else(|| input["timeout_secs"].as_u64())
+                .or_else(|| input["timeout_ms"].as_u64().map(|ms| ms.div_ceil(1000)))
                 .unwrap_or(DEFAULT_TIMEOUT_SECS)
                 .clamp(1, MAX_TIMEOUT_SECS);
             let mut env_overrides = input["env"]
@@ -549,9 +559,7 @@ impl Tool for ShellTool {
                     unreachable!("detached handled above")
                 }
                 Ok(Err(error)) => {
-                    return recovery_error(format!(
-                        "Sandbox setup or cleanup failed; command was not retried outside the sandbox: {error:#}"
-                    ), ctx, true)
+                    return recovery_error(sandbox_mode.setup_failure(format!("{error:#}")), ctx, true)
                 }
                 Err(error) => {
                     return recovery_error(format!(
@@ -562,14 +570,16 @@ impl Tool for ShellTool {
             let mut report = output.recovery_report(recovery_operation_id(ctx))?;
             if output.timed_out {
                 return report.attach(ToolResult::err(format!(
-                    "Command timed out after {timeout_secs}s; the AppContainer Job Object was terminated."
+                    "Command timed out after {timeout_secs}s; {}.",
+                    sandbox_mode.stop_note()
                 ))).map_err(anyhow::Error::msg);
             }
             if output.cancelled {
                 return report
-                    .attach(ToolResult::err(
-                        "Command was cancelled; the AppContainer Job Object was terminated.",
-                    ))
+                    .attach(ToolResult::err(format!(
+                        "Command was cancelled; {}.",
+                        sandbox_mode.stop_note()
+                    )))
                     .map_err(anyhow::Error::msg);
             }
 

@@ -17,7 +17,15 @@ const UTF8_BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
 /// use a different tool instead of silently truncating or OOM-ing."
 const MAX_FILE_WRITE_CONTENT_CHARS: usize = 200_000;
 
-/// Return true if the file starts with a UTF-8 BOM.
+fn powershell_script_needs_utf8_bom(path: &std::path::Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.to_ascii_lowercase())
+            .as_deref(),
+        Some("ps1" | "psm1" | "psd1")
+    )
+}
 fn file_has_utf8_bom(path: &std::path::Path) -> bool {
     let mut buf = [0u8; 3];
     if let Ok(mut f) = std::fs::File::open(path) {
@@ -169,6 +177,8 @@ impl Tool for FileWriteTool {
          \n\
          Encoding: this tool always writes UTF-8. If the target file already exists and has a UTF-8 BOM \
          (common for files created by Notepad or PowerShell on Windows), the BOM is automatically preserved. \
+         New and edited .ps1, .psm1, and .psd1 files are written with a UTF-8 BOM because Windows PowerShell 5.1 \
+         reads a script file that has no BOM using the Windows ANSI code page (GBK on Chinese Windows). \
          WARNING: do NOT use file_write for files that must stay in GBK/GB18030 or other non-UTF-8 encodings \
          (for example legacy config files). To keep GBK, on Windows use the shell tool with PowerShell \
          `[System.IO.File]::WriteAllText(path, content, [System.Text.Encoding]::GetEncoding('gbk'))`. \
@@ -259,7 +269,8 @@ impl Tool for FileWriteTool {
         }
 
         let existed = path.exists();
-        let preserve_bom = existed && file_has_utf8_bom(&path);
+        let preserve_bom = powershell_script_needs_utf8_bom(&path)
+            || (existed && file_has_utf8_bom(&path));
         write_with_bom_policy(&path, content, preserve_bom)?;
 
         let action = if existed { "Updated" } else { "Created" };
@@ -380,6 +391,8 @@ impl Tool for FileEditTool {
          \n\
          Encoding: file_edit reads the file as bytes, strips any UTF-8 BOM before matching, \
          then restores the BOM on write-back — so BOM-bearing files are handled transparently. \
+         .ps1, .psm1, and .psd1 are written back with a UTF-8 BOM so Windows PowerShell 5.1 reads them as UTF-8 \
+         instead of the Windows ANSI code page. \
          However, file_edit only supports UTF-8 and UTF-8-BOM files. Do NOT use file_edit on \
          GBK/GB18030 files — the byte-level mismatch will corrupt the file. If file_read reports \
          '[encoding: gbk]' for a file, do not use file_edit. On Windows, edit it through the shell tool with PowerShell. On Linux and macOS, use a program that selects the encoding."
@@ -518,7 +531,7 @@ impl Tool for FileEditTool {
         };
 
         let raw = std::fs::read(&path)?;
-        let preserve_bom = raw.starts_with(UTF8_BOM);
+        let preserve_bom = powershell_script_needs_utf8_bom(&path) || raw.starts_with(UTF8_BOM);
         let (content, encoding) = decode_bytes(&raw);
         let lines_before = content.lines().count();
 
@@ -526,15 +539,25 @@ impl Tool for FileEditTool {
         // file on disk may be CRLF (or vice versa). If the snippet does not match
         // verbatim, retry with its line endings converted to the file's style, and
         // convert `new` the same way so the file keeps a consistent EOL.
+        // Mixed-EOL files: try both styles — a whole-file "contains CRLF" guess
+        // would wrongly convert snippets targeting the LF regions.
         let file_is_crlf = content.contains("\r\n");
         for (old, new) in pairs.iter_mut() {
             if content.contains(old.as_str()) {
                 continue;
             }
-            let adapted_old = adapt_eol(old, file_is_crlf);
-            if adapted_old != *old && content.contains(adapted_old.as_str()) {
-                *new = adapt_eol(new, file_is_crlf);
-                *old = adapted_old;
+            let mut adapted = adapt_eol(old, file_is_crlf);
+            let mut target_crlf = file_is_crlf;
+            if adapted == *old || !content.contains(adapted.as_str()) {
+                let other = adapt_eol(old, !file_is_crlf);
+                if other != *old && content.contains(other.as_str()) {
+                    adapted = other;
+                    target_crlf = !file_is_crlf;
+                }
+            }
+            if adapted != *old && content.contains(adapted.as_str()) {
+                *new = adapt_eol(new, target_crlf);
+                *old = adapted;
             }
         }
 
@@ -667,5 +690,84 @@ mod eol_tests {
     fn ambiguous_match_lines_reports_one_based_lines() {
         let content = "let a = 1;\nlet b = 2;\nlet a = 1;\n";
         assert_eq!(find_ambiguous_match_lines(content, "let a = 1;", 5), vec![1, 3]);
+    }
+}
+
+#[cfg(test)]
+mod powershell_bom_tests {
+    use super::{powershell_script_needs_utf8_bom, write_with_bom_policy};
+
+    #[test]
+    fn powershell_scripts_are_written_with_a_utf8_bom() {
+        assert!(powershell_script_needs_utf8_bom(std::path::Path::new("task.ps1")));
+        assert!(powershell_script_needs_utf8_bom(std::path::Path::new("Mod.PSM1")));
+        assert!(!powershell_script_needs_utf8_bom(std::path::Path::new("main.rs")));
+        let dir = std::env::temp_dir().join(format!("agentz-ps1-bom-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("note.ps1");
+        write_with_bom_policy(&path, "# comment\nWrite-Output 1\n", true).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(&bytes[..3], &[0xEF, 0xBB, 0xBF]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod mixed_eol_tests {
+    use super::*;
+    use crate::agent::tool::ToolSettings;
+    use serde_json::json;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+
+    fn test_ctx(root: std::path::PathBuf) -> ToolContext {
+        ToolContext {
+            session_id: "mixed-eol-test".into(),
+            workspace_root: root,
+            bypass_permissions: false,
+            settings: Arc::new(ToolSettings::default()),
+            max_iterations: Some(1),
+            memory_owner_id: "piscis".into(),
+            pool_session_id: None,
+            tool_use_id: None,
+            cancel: Arc::new(AtomicBool::new(false)),
+            loop_halt: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn edit_matches_lf_region_of_a_mixed_eol_file() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("piscis-mixed-eol-{nanos}"));
+        std::fs::create_dir_all(&root).unwrap();
+        let ctx = test_ctx(root.clone());
+
+        // CRLF head, LF tail: a whole-file "contains CRLF" guess would convert
+        // the snippet to CRLF and fail to match the LF region.
+        let mixed = "head-a\r\nhead-b\r\ntail-a\ntail-b\n";
+        std::fs::write(root.join("mixed.txt"), mixed).unwrap();
+
+        let result = FileEditTool
+            .call(
+                json!({
+                    "path": "mixed.txt",
+                    "old_string": "tail-a\ntail-b",
+                    "new_string": "tail-x\ntail-y"
+                }),
+                &ctx,
+            )
+            .await
+            .expect("call should not error at the Rust level");
+        assert!(!result.is_error, "content={}", result.content);
+
+        let after = std::fs::read_to_string(root.join("mixed.txt")).unwrap();
+        assert!(after.contains("head-a\r\nhead-b\r\n"), "CRLF region untouched: {after:?}");
+        assert!(after.contains("tail-x\ntail-y"), "LF region edited with LF: {after:?}");
+        assert!(!after.contains("tail-x\r\n"), "must not inject CRLF into the LF region: {after:?}");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
