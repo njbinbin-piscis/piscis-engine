@@ -37,6 +37,22 @@ pub fn is_secret_or_metadata(name: &str) -> bool {
     matches!(n.as_str(), ".agentz" | ".codez" | ".piscis" | ".secret_key" | ".env") || n.starts_with(".env.")
 }
 
+/// Host-state entries inside `.agentz` that searches must not read even when the
+/// agent explicitly targets its own working area: databases, config, credentials,
+/// indexes and logs. Working documents (REPO_MEMORY.md, AGENT_CODING_BRIEF.md,
+/// plans/*.md) are NOT host state and stay searchable.
+pub fn is_agentz_host_state(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    n.ends_with(".db")
+        || n.ends_with(".db-wal")
+        || n.ends_with(".db-shm")
+        || n.ends_with(".sqlite")
+        || n.ends_with(".json")
+        || n.ends_with(".log")
+        || n.starts_with(".env")
+        || n == ".secret_key"
+}
+
 pub fn is_excluded_search_directory(name: &str) -> bool {
     EXCLUDED_SEARCH_DIRECTORY_NAMES
         .iter()
@@ -60,6 +76,8 @@ impl Tool for FileSearchTool {
            ** (any path segment), ? (single char). Example: '*.rs', '**/*.json', 'config*'. \
          - 'grep': Search file contents for a regex pattern. Returns matching lines with file path and line number. \
            Use 'include' to filter by file extension (e.g. '*.rs', '*.txt'). \
+           Regex syntax: the engine supports character classes, alternation, anchors and groups, but NOT look-around \
+           ((?=...), (?!...), (?<=...), (?<!...)) or backreferences. For 'assignment not comparison' use `=[^=]`, not `=(?!=)`. \
          \
          path must be a directory. A file path is an error (`Path is not a directory`), not an empty result. \
          To search one file, pass its parent directory and set include to that file name, or use file_read. \
@@ -324,8 +342,10 @@ impl FileSearchTool {
                 Ok(r) => r,
                 Err(e) => {
                     return Ok(ToolResult::err(format!(
-                        "Invalid regex '{}': {}",
-                        pattern, e
+                        "Invalid regex '{}': {}{}",
+                        pattern,
+                        e,
+                        regex_rewrite_hint(&e.to_string())
                     )))
                 }
             }
@@ -512,11 +532,15 @@ fn walk_dir_opts<F: FnMut(&Path) -> bool>(
     for entry in entries.flatten() {
         let path = entry.path();
         let is_dir = path.is_dir();
-        if path
-            .file_name()
-            .map(os_text)
-            .is_some_and(|n| is_secret_or_metadata(&n))
-        {
+        let entry_name = path.file_name().map(os_text).unwrap_or_default();
+        // `.agentz` is the agent's own working area: searches may descend into it
+        // (repo memory, plans) but never read host-state entries inside. Other
+        // tool-state/secret directories stay fully skipped.
+        if is_secret_or_metadata(&entry_name) && !entry_name.eq_ignore_ascii_case(".agentz") {
+            continue;
+        }
+        let in_agentz = dir.file_name().map(os_text).as_deref() == Some(".agentz");
+        if in_agentz && is_agentz_host_state(&entry_name) {
             continue;
         }
         if is_dir {
@@ -540,6 +564,26 @@ fn walk_dir_opts<F: FnMut(&Path) -> bool>(
             walk_dir_opts(&path, depth + 1, max_depth, include_ignored, skipped_dirs, visitor);
         }
     }
+}
+
+/// #30: the `regex` crate has no look-around/backreferences. When a pattern fails
+/// for that reason, append a concrete rewrite hint so the agent does not burn
+/// rounds approximating the same intent with character classes.
+fn regex_rewrite_hint(err: &str) -> String {
+    let lower = err.to_ascii_lowercase();
+    if lower.contains("look-around") || lower.contains("look-ahead") || lower.contains("look-behind")
+    {
+        return " The regex engine does not support look-around. Rewrite without it: \
+                e.g. 'assignment not comparison' → search `=[^=]` (or search `=` then filter); \
+                'word not followed by X' → match the word and exclude X in a second pass."
+            .to_string();
+    }
+    if lower.contains("backreference") {
+        return " The regex engine does not support backreferences. Match the repeated \
+                structure with an explicit character class or alternation instead."
+            .to_string();
+    }
+    String::new()
 }
 
 /// Convert a glob pattern to a regex string.
@@ -708,6 +752,86 @@ mod tests {
                 result.content
             );
         }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #28: searching the agent's own `.agentz` working area finds working
+    /// documents (repo memory, plans) but never descends into host-state files.
+    #[tokio::test]
+    async fn grep_agentz_finds_working_docs_not_host_state() {
+        use crate::agent::tool::{Tool, ToolContext, ToolSettings};
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+
+        let root =
+            std::env::temp_dir().join(format!("file-search-agentz-{}", uuid::Uuid::new_v4()));
+        let az = root.join(".agentz");
+        std::fs::create_dir_all(az.join("plans")).unwrap();
+        std::fs::write(az.join("REPO_MEMORY.md"), "needle working doc").unwrap();
+        std::fs::write(az.join("plans").join("p.md"), "needle plan").unwrap();
+        std::fs::write(az.join("journal.db"), "needle secret state").unwrap();
+        let ctx = ToolContext {
+            session_id: "file-search".into(),
+            workspace_root: root.clone(),
+            bypass_permissions: false,
+            settings: Arc::new(ToolSettings::default()),
+            max_iterations: None,
+            memory_owner_id: "test".into(),
+            pool_session_id: None,
+            tool_use_id: None,
+            cancel: Arc::new(AtomicBool::new(false)),
+            loop_halt: None,
+        };
+        let result = FileSearchTool
+            .call(
+                json!({ "action": "grep", "pattern": "needle", "path": ".agentz" }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error, "{}", result.content);
+        assert!(result.content.contains("REPO_MEMORY.md"), "{}", result.content);
+        assert!(result.content.contains("p.md"), "{}", result.content);
+        assert!(!result.content.contains("journal.db"), "{}", result.content);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #30: a look-around regex must return the engine limitation PLUS a concrete
+    /// rewrite hint, not a bare error that sends the agent into近似-search rounds.
+    #[tokio::test]
+    async fn grep_lookaround_error_includes_rewrite_hint() {
+        use crate::agent::tool::{Tool, ToolContext, ToolSettings};
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+
+        let root =
+            std::env::temp_dir().join(format!("file-search-lookaround-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("a.rs"), "let x = 1;").unwrap();
+        let ctx = ToolContext {
+            session_id: "file-search".into(),
+            workspace_root: root.clone(),
+            bypass_permissions: false,
+            settings: Arc::new(ToolSettings::default()),
+            max_iterations: None,
+            memory_owner_id: "test".into(),
+            pool_session_id: None,
+            tool_use_id: None,
+            cancel: Arc::new(AtomicBool::new(false)),
+            loop_halt: None,
+        };
+        let result = FileSearchTool
+            .call(
+                json!({ "action": "grep", "pattern": r"=(?!=)", "path": "." }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(result.is_error, "{}", result.content);
+        // Still reports the limitation...
+        assert!(result.content.contains("look-around"), "{}", result.content);
+        // ...but now also gives a usable rewrite path.
+        assert!(result.content.contains("=[^=]"), "{}", result.content);
         let _ = std::fs::remove_dir_all(&root);
     }
 }

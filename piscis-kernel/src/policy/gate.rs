@@ -30,6 +30,33 @@ static BLOCKED_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
     ]
 });
 
+/// Prefix of the warning text for a command that can permanently destroy
+/// uncommitted work. The agent loop always asks the user about these, even when
+/// the user switched shell confirmation off.
+pub const DESTRUCTIVE_WARNING_PREFIX: &str = "Destructive command";
+
+/// Commands that delete or overwrite work in ways git or the recycle bin cannot undo.
+static DESTRUCTIVE_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
+    vec![
+        Regex::new(r"(?i)\brm\s+(-[a-z]*r[a-z]*|--recursive)\b").unwrap(),
+        Regex::new(r"(?i)\bRemove-Item\b[^|;&]*-Recurse").unwrap(),
+        Regex::new(r"(?i)\b(rd|rmdir)\s+/s\b").unwrap(),
+        Regex::new(r"(?i)\bdel\s+(/[a-z]\s+)*/s\b").unwrap(),
+        Regex::new(r"(?i)\bgit\s+reset\s+--hard\b").unwrap(),
+        Regex::new(r"(?i)\bgit\s+clean\s+(-[a-z]*f|--force)").unwrap(),
+        Regex::new(r"(?i)\bgit\s+checkout\s+(-f\b|--force\b|--\s+\.)").unwrap(),
+        Regex::new(r"(?i)\bgit\s+restore\s+(--source[^|;&]*\s)?(--worktree\s+)?\.\s*$").unwrap(),
+        Regex::new(r"(?i)\bgit\s+(?:-[^\s]+\s+[^\s]+\s+)*(stash\s+(drop|clear)|branch\s+-D)\b").unwrap(),
+        Regex::new(r"(?i)\brimraf\b").unwrap(),
+    ]
+});
+
+/// Stash deletion deserves an inspect-then-confirm path (#35): a generic
+/// "this is destructive" warning gives the user nothing to judge, so name the
+/// exact commands that reveal what would be lost before they approve.
+static STASH_DELETE_PATTERN: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)\bgit\s+(?:-[^\s]+\s+[^\s]+\s+)*stash\s+(drop|clear)\b").unwrap());
+
 static WARN_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
     vec![
         Regex::new(r"(?i)pip\s+install").unwrap(),
@@ -243,16 +270,29 @@ impl PolicyGate {
 
     /// Check a shell command string
     pub fn check_command(&self, command: &str) -> PolicyDecision {
-        if self.mode == PolicyMode::Dev {
-            return PolicyDecision::Allow;
+        if self.mode != PolicyMode::Dev {
+            for pattern in BLOCKED_PATTERNS.iter() {
+                if pattern.is_match(command) {
+                    return PolicyDecision::Deny(format!(
+                        "Command matches blocked pattern: {}",
+                        pattern.as_str()
+                    ));
+                }
+            }
         }
-        for pattern in BLOCKED_PATTERNS.iter() {
-            if pattern.is_match(command) {
-                return PolicyDecision::Deny(format!(
-                    "Command matches blocked pattern: {}",
-                    pattern.as_str()
+        // Destroying work is never silent, in any mode.
+        if DESTRUCTIVE_PATTERNS.iter().any(|p| p.is_match(command)) {
+            if STASH_DELETE_PATTERN.is_match(command) {
+                return PolicyDecision::Warn(format!(
+                    "{DESTRUCTIVE_WARNING_PREFIX}: this permanently deletes saved stash entries, which git cannot recover. Inspect before approving: run `git stash list` to see the entries, then `git stash show -p <stash>` (e.g. stash@{{0}}) to preview the exact changes that would be lost. Only allow the drop/clear after checking that content."
                 ));
             }
+            return PolicyDecision::Warn(format!(
+                "{DESTRUCTIVE_WARNING_PREFIX}: this can permanently delete or overwrite files that are not committed. Check the command before allowing it."
+            ));
+        }
+        if self.mode == PolicyMode::Dev {
+            return PolicyDecision::Allow;
         }
         for pattern in WARN_PATTERNS.iter() {
             if pattern.is_match(command) {
@@ -487,6 +527,44 @@ mod tests {
     use super::*;
     use std::env;
 
+    #[test]
+    fn commands_that_destroy_uncommitted_work_always_ask_in_every_mode() {
+        for mode in ["strict", "balanced", "dev"] {
+            let g = PolicyGate::with_profile(env::current_dir().unwrap(), mode, 0);
+            for cmd in [
+                "rm -rf ./project",
+                "rm -r src",
+                "Remove-Item -Path .\\src -Recurse -Force",
+                "rd /s /q build",
+                "del /s /q *.rs",
+                "git reset --hard HEAD~1",
+                "git clean -fd",
+                "git checkout -- .",
+                "git stash drop",
+                "git branch -D feature",
+                "npx rimraf dist",
+            ] {
+                match g.check_command(cmd) {
+                    PolicyDecision::Warn(msg) => {
+                        assert!(msg.starts_with(DESTRUCTIVE_WARNING_PREFIX), "{mode} {cmd}")
+                    }
+                    other => panic!("{mode} `{cmd}` should warn, got {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_commands_are_not_flagged_as_destructive() {
+        let g = PolicyGate::with_profile(env::current_dir().unwrap(), "balanced", 0);
+        for cmd in ["git status", "git diff", "cargo test", "ls -la", "git reset --soft HEAD~1", "rm file.txt"] {
+            assert!(
+                !matches!(g.check_command(cmd), PolicyDecision::Warn(m) if m.starts_with(DESTRUCTIVE_WARNING_PREFIX)),
+                "{cmd}"
+            );
+        }
+    }
+
     fn gate() -> PolicyGate {
         PolicyGate::new(env::current_dir().unwrap())
     }
@@ -553,6 +631,44 @@ mod tests {
     fn allows_safe_echo() {
         let g = gate();
         assert_eq!(g.check_command("echo hello world"), PolicyDecision::Allow);
+    }
+
+    // ── #35: stash drop/clear must offer an inspect-then-confirm path ─────
+    #[test]
+    fn stash_drop_warning_names_inspect_commands() {
+        let g = gate();
+        for cmd in [
+            "git stash drop",
+            "git stash drop stash@{0}",
+            "git stash clear",
+            "git -C sub stash drop",
+        ] {
+            match g.check_command(cmd) {
+                PolicyDecision::Warn(msg) => {
+                    assert!(
+                        msg.contains("git stash list"),
+                        "{cmd}: warning must tell the user how to inspect first, got: {msg}"
+                    );
+                    assert!(
+                        msg.contains("git stash show"),
+                        "{cmd}: warning must name the content-preview command, got: {msg}"
+                    );
+                }
+                other => panic!("{cmd}: expected Warn, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn other_destructive_commands_keep_generic_warning() {
+        let g = gate();
+        match g.check_command("git reset --hard HEAD~1") {
+            PolicyDecision::Warn(msg) => {
+                assert!(msg.starts_with(DESTRUCTIVE_WARNING_PREFIX));
+                assert!(!msg.contains("git stash list"));
+            }
+            other => panic!("expected Warn, got {other:?}"),
+        }
     }
 
     // ── check_url ──────────────────────────────────────────────────────────

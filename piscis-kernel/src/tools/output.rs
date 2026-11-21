@@ -195,13 +195,13 @@ fn head_tail_lines(s: &str, max_bytes: usize) -> String {
 
     let mut head_end = 0usize; // exclusive line index
     let mut used = 0usize;
-    while head_end < lines.len() && used + lines[head_end].len() + 1 <= head_budget {
+    while head_end < lines.len() && used + lines[head_end].len() < head_budget {
         used += lines[head_end].len() + 1;
         head_end += 1;
     }
     let mut tail_start = lines.len();
     let mut tused = 0usize;
-    while tail_start > head_end && tused + lines[tail_start - 1].len() + 1 <= tail_budget {
+    while tail_start > head_end && tused + lines[tail_start - 1].len() < tail_budget {
         tused += lines[tail_start - 1].len() + 1;
         tail_start -= 1;
     }
